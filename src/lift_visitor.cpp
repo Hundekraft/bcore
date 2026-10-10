@@ -348,12 +348,41 @@ void LiftVisitor::emit_epilog(uint32_t insn_pc, uint32_t insn_len) {
     // bfin_hwloop_step():
     //   Phase A (when !did_jump): redirects cpu->pc via hw-loop back-edge rules.
     //   Phase B (always): decrements loop counter(s) whose bottom == insn_pc.
+    // Inline fast path: only an instruction at a loop bottom (LB0/LB1) needs the helper. Every other
+    // instruction just advances pc to the fallthrough unless it branched (bfin_hwloop_step does exactly
+    // that when neither LB matches, and Phase B then has nothing to decrement).
     auto* ft = llvm::FunctionType::get(
         builder_.getVoidTy(),
         {builder_.getInt8PtrTy(), builder_.getInt32Ty(), builder_.getInt32Ty()},
         false);
-    call_extern("bfin_hwloop_step", ft,
-        {cpu_ptr_, builder_.getInt32(insn_pc), builder_.getInt32(insn_pc + insn_len)});
+    {
+        auto& ctx = builder_.getContext();
+        auto* fn_ = builder_.GetInsertBlock()->getParent();
+        auto* bb_slow = llvm::BasicBlock::Create(ctx, "hwloop_slow", fn_);
+        auto* bb_fast = llvm::BasicBlock::Create(ctx, "hwloop_fast", fn_);
+        auto* bb_done = llvm::BasicBlock::Create(ctx, "hwloop_done", fn_);
+        auto* pc_c = builder_.getInt32(insn_pc);
+        auto* lb0 = load_cpu_u32(offsetof(CpuState, lb), "lb0");
+        auto* lb1 = load_cpu_u32(offsetof(CpuState, lb) + sizeof(uint32_t), "lb1");
+        auto* at_bottom = builder_.CreateOr(builder_.CreateICmpEQ(lb0, pc_c), builder_.CreateICmpEQ(lb1, pc_c));
+        llvm::MDBuilder mdb(ctx);
+        builder_.CreateCondBr(at_bottom, bb_slow, bb_fast, mdb.createBranchWeights(1, 1000));
+
+        builder_.SetInsertPoint(bb_slow);
+        call_extern("bfin_hwloop_step", ft,
+            {cpu_ptr_, pc_c, builder_.getInt32(insn_pc + insn_len)});
+        builder_.CreateBr(bb_done);
+
+        builder_.SetInsertPoint(bb_fast);
+        auto* dj_ptr = cpu_field_ptr(offsetof(CpuState, did_jump), builder_.getInt8Ty());
+        auto* jumped = builder_.CreateICmpNE(builder_.CreateLoad(builder_.getInt8Ty(), dj_ptr), builder_.getInt8(0));
+        auto* cur_pc = load_cpu_u32(offsetof(CpuState, pc), "pc");
+        store_cpu_u32(offsetof(CpuState, pc),
+                      builder_.CreateSelect(jumped, cur_pc, builder_.getInt32(insn_pc + insn_len)));
+        builder_.CreateBr(bb_done);
+
+        builder_.SetInsertPoint(bb_done);
+    }
     if (check_cec_pending_) {
         auto* ft_check = llvm::FunctionType::get(builder_.getVoidTy(), {builder_.getInt8PtrTy()}, false);
         call_extern("cec_check_pending", ft_check, {cpu_ptr_});
@@ -1711,8 +1740,12 @@ bool LiftVisitor::decode_ProgCtrl_RTE() {
 bool LiftVisitor::decode_ProgCtrl_IDLE() {
     if (parallel_slot_ > 0) return false;
 
-    // In single-threaded user-mode emulation, IDLE has no wake-up sources;
-    // treat as a sync NOP (matches CSYNC/SSYNC handling).
+    // IDLE stalls the core until an interrupt. Flag it and end the block so the host can let guest time
+    // pass without executing the idle loop (cec_take_idle); a host that ignores the flag gets the old
+    // behavior (IDLE as a NOP), since execution continues at the next instruction.
+    auto* ft = FunctionType::get(builder_.getVoidTy(), {builder_.getInt8PtrTy()}, false);
+    call_extern("cec_idle", ft, {cpu_ptr_});
+    terminated_ = true;
     return true;
 }
 bool LiftVisitor::decode_ProgCtrl_CLI(uint16_t d) {

@@ -27,6 +27,7 @@
 
 #include "syscall_emu.h"
 #include "cec.h"
+#include "mmr.h"
 #include "cpu_state.h"
 
 // Object files on disk, one per block, named <key>.o. Only modules tagged by tag_cached_module (identifier
@@ -173,6 +174,7 @@ bool JitEngine::init(int opt_level, int codegen_level) {
     symbols[jit_->mangleAndIntern("cec_pop_reti")]        = sym_from_ptr(reinterpret_cast<void*>(&cec_pop_reti));
     symbols[jit_->mangleAndIntern("cec_check_sup")]       = sym_from_ptr(reinterpret_cast<void*>(&cec_check_sup));
     symbols[jit_->mangleAndIntern("cec_is_user_mode")]    = sym_from_ptr(reinterpret_cast<void*>(&cec_is_user_mode));
+    symbols[jit_->mangleAndIntern("cec_idle")]            = sym_from_ptr(reinterpret_cast<void*>(&cec_idle));
     symbols[jit_->mangleAndIntern("cec_check_pending")]   = sym_from_ptr(reinterpret_cast<void*>(&cec_check_pending));
     symbols[jit_->mangleAndIntern("bfin_hwloop_step")]    = sym_from_ptr(reinterpret_cast<void*>(&bfin_hwloop_step));
     // Not called by the lifter. With an IR pipeline, LoopIdiomRecognize can turn

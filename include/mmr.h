@@ -65,3 +65,11 @@ void cec_init();
 
 // Returns the current active IVG level: -1 = user mode, >=0 = supervisor.
 int cec_current_ivg();
+// True once after the guest executed IDLE (the block ended there); clears the flag. The host may then let
+// guest time pass, polling devices, until an interrupt is taken.
+bool cec_take_idle();
+// Current ILAT (latched interrupts, set even while masked in IMASK): IDLE wakes when a new bit latches.
+uint32_t cec_ilat();
+// An interrupt was raised and cec_check_pending has not looked at it yet.
+bool cec_pending();
+extern "C" void cec_idle(CpuState* cpu);

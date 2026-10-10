@@ -481,6 +481,21 @@ extern "C" void cec_check_sup(CpuState* cpu) {
     require_supervisor(cpu);
 }
 
+// ── IDLE ──────────────────────────────────────────────────────────────────────
+
+static bool s_idle = false;
+
+extern "C" void cec_idle(CpuState*) { s_idle = true; }
+
+uint32_t cec_ilat() { return ilat(); }
+bool cec_pending() { return s_cec_pending; }
+
+bool cec_take_idle() {
+    const bool idle = s_idle;
+    s_idle = false;
+    return idle;
+}
+
 // ── Pending interrupt check ───────────────────────────────────────────────────
 
 extern "C" void cec_check_pending(CpuState* cpu) {
