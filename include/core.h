@@ -39,6 +39,9 @@ public:
     void set_chain_budget(uint32_t packets) { chain_budget_ = packets; }
     uint64_t object_cache_hits() const;
     uint64_t object_cache_misses() const;
+    // Host time spent translating blocks that were not already loaded (lift + optimize + codegen or cache load).
+    uint64_t translate_ns() const { return translate_ns_; }
+    uint64_t translate_count() const { return translate_count_; }
 
     // ---- JIT observability (contract in bcore_profile.h) ----
 
@@ -92,6 +95,7 @@ private:
     std::string translation_salt_;
     uint32_t chain_budget_ = 0;
     uint64_t cache_hits_base_ = 0, cache_misses_base_ = 0;
+    uint64_t translate_ns_ = 0, translate_count_ = 0;
     int codegen_level_ = -1;
     bool dump_ir_ = false;
 };

@@ -48,6 +48,9 @@ endif()
 # lifting, so it must not survive any change to how blocks are lifted. Reconfigures when a source changes.
 file(GLOB BCORE_FINGERPRINT_FILES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/*.h ${CMAKE_CURRENT_SOURCE_DIR}/include/*.h)
+# Files that can't change the code a block compiles to (driver loop, cache container, profiling) stay out,
+# so editing them keeps the cache. Anything that lifts, optimizes or is called from JIT code stays in.
+list(FILTER BCORE_FINGERPRINT_FILES EXCLUDE REGEX "/(src/core\\.cpp|include/core\\.h|src/object_pack\\.(cpp|h)|src/profile\\.cpp|src/profile_state\\.h|include/bcore_profile\\.h|src/disasm_visitor\\.(cpp|h))$")
 list(SORT BCORE_FINGERPRINT_FILES)
 set(_bcore_fp "")
 foreach(_f ${BCORE_FINGERPRINT_FILES})

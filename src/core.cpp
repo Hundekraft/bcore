@@ -1,3 +1,4 @@
+#include <chrono>
 #include "core.h"
 #include "mmr.h"
 
@@ -69,6 +70,11 @@ bool Core::run(uint32_t pc) {
     if (!fn && jit_->try_load_by_bytes(pc, mem_))
         fn = jit_->lookup(pc);
     if (!fn) {
+        const auto host_t0 = std::chrono::steady_clock::now();
+        struct AddTime {
+            uint64_t& ns; uint64_t& n; std::chrono::steady_clock::time_point t0;
+            ~AddTime() { ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); ++n; }
+        } add_time{translate_ns_, translate_count_, host_t0};
 #if BCORE_ENABLE_PROFILE
         BcoreEventSink* sink = profile_->sink;
         profile_->stats.cache_misses++;
