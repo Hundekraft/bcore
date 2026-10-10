@@ -70,6 +70,11 @@ int cec_current_ivg();
 bool cec_take_idle();
 // Current ILAT (latched interrupts, set even while masked in IMASK): IDLE wakes when a new bit latches.
 uint32_t cec_ilat();
+// Current IPEND (levels being serviced, plus global-disable bit 4).
+uint32_t cec_ipend();
+// A latched, unmasked interrupt of higher priority than the current level is waiting (cec_check_pending
+// would dispatch it now).
+bool cec_deliverable(CpuState* cpu);
 // An interrupt was raised and cec_check_pending has not looked at it yet.
 bool cec_pending();
 extern "C" void cec_idle(CpuState* cpu);

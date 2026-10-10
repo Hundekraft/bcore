@@ -488,6 +488,20 @@ static bool s_idle = false;
 extern "C" void cec_idle(CpuState*) { s_idle = true; }
 
 uint32_t cec_ilat() { return ilat(); }
+uint32_t cec_ipend() { return ipend(); }
+
+// Same test as _cec_raise_internal(cpu, -1): would a check-pending dispatch an interrupt now?
+bool cec_deliverable(CpuState* cpu) {
+    if (ipend() & IVG_IRPTEN_B) return false;
+    const uint32_t pending = ilat() & imask();
+    if (!pending) return false;
+    int curr = cec_current_ivg();
+    if (curr == -1) curr = static_cast<int>(IVG_USER);
+    const int ivg = __builtin_ctz(pending);
+    if (ivg > curr) return false;
+    if (!(cpu->syscfg & SYSCFG_SNEN) && ivg == curr) return false;
+    return true;
+}
 bool cec_pending() { return s_cec_pending; }
 
 bool cec_take_idle() {
