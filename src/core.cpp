@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include <chrono>
 #include "core.h"
 #include "mmr.h"
@@ -73,8 +75,19 @@ bool Core::run(uint32_t pc) {
         const auto host_t0 = std::chrono::steady_clock::now();
         struct AddTime {
             uint64_t& ns; uint64_t& n; std::chrono::steady_clock::time_point t0;
-            ~AddTime() { ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); ++n; }
-        } add_time{translate_ns_, translate_count_, host_t0};
+            uint32_t pc;
+            uint64_t slow_lift_ns = 0, slow_opt_ns = 0;
+            unsigned slow_ir = 0, slow_bytes = 0;
+            ~AddTime() {
+                const uint64_t d = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                ns += d; ++n;
+                // BCORE_SLOW_MS=N: report translations slower than N ms (pc, time) on stderr.
+                static const long slow = getenv("BCORE_SLOW_MS") ? strtol(getenv("BCORE_SLOW_MS"), nullptr, 10) : -1;
+                if (slow >= 0 && d >= (uint64_t)slow * 1000000ull)
+                    fprintf(stderr, "bcore: slow translate pc=0x%08x %.1f ms (lift %.1f, optimize %.1f, %u IR insns, %u guest bytes)\n",
+                            pc, d / 1e6, slow_lift_ns / 1e6, slow_opt_ns / 1e6, slow_ir, slow_bytes);
+            }
+        } add_time{translate_ns_, translate_count_, host_t0, pc};
 #if BCORE_ENABLE_PROFILE
         BcoreEventSink* sink = profile_->sink;
         profile_->stats.cache_misses++;
@@ -94,6 +107,10 @@ bool Core::run(uint32_t pc) {
         } fail_on_unwind{sink, pc, t0};
 #endif
         auto result = translator_->translate(pc);
+        const auto host_lift_end = std::chrono::steady_clock::now();
+        add_time.slow_lift_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(host_lift_end - host_t0).count();
+        add_time.slow_ir = result.module ? (unsigned)result.module->getInstructionCount() : 0;
+        add_time.slow_bytes = result.end_pc > pc ? result.end_pc - pc : 0;
 #if BCORE_ENABLE_PROFILE
         // Stage callbacks fire only after the translation is timed, so
         // nothing the sink does lands inside a stage or in translate_ns.
@@ -107,7 +124,9 @@ bool Core::run(uint32_t pc) {
         // A cached object skips the IR pipeline and codegen: addModule loads it.
         const bool cached = jit_->tag_cached_module(*result.module);
         if (opt_level_ != 0 && !cached) {
+            const auto opt_t0 = std::chrono::steady_clock::now();
             jit_->optimize_module(*result.module);
+            add_time.slow_opt_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - opt_t0).count();
 #if BCORE_ENABLE_PROFILE
             optimize_end = bcore_profile::monotonic_ns();
 #endif

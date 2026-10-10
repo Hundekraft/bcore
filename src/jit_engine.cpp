@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "jit_engine.h"
 
 #include <cstdio>
@@ -87,6 +88,32 @@ static llvm::JITEvaluatedSymbol sym_from_ptr(void* ptr) {
         llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
 }
 
+namespace {
+// Very large blocks (long straight-line guest code lifts to 5k-20k IR instructions) spend 40-250 ms in the
+// backend at CodeGenOpt::Default, and every compile stalls the guest. Those use the fast backend
+// (CodeGenOpt::None: FastISel, fast register allocation); everything else keeps the configured level. The
+// choice depends only on the optimized module, so it is reproducible and the object cache stays valid.
+// BCORE_FAST_CG_IR=N sets the IR instruction threshold (0 = off).
+class SizeTieredCompiler : public llvm::orc::IRCompileLayer::IRCompiler {
+public:
+    SizeTieredCompiler(std::unique_ptr<llvm::TargetMachine> normal, std::unique_ptr<llvm::TargetMachine> fast,
+                       llvm::ObjectCache* cache, unsigned threshold)
+        : IRCompiler(llvm::orc::irManglingOptionsFromTargetOptions(normal->Options)),
+          normal_tm_(std::move(normal)), fast_tm_(std::move(fast)),
+          normal_(*normal_tm_, cache), fast_(*fast_tm_, cache), threshold_(threshold) {}
+
+    llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> operator()(llvm::Module& m) override {
+        if (threshold_ && m.getInstructionCount() > threshold_) return fast_(m);
+        return normal_(m);
+    }
+
+private:
+    std::unique_ptr<llvm::TargetMachine> normal_tm_, fast_tm_;
+    llvm::orc::SimpleCompiler normal_, fast_;
+    unsigned threshold_;
+};
+}  // namespace
+
 bool JitEngine::init(int opt_level, int codegen_level) {
     opt_level_ = opt_level;
     llvm::InitializeNativeTarget();
@@ -147,7 +174,13 @@ bool JitEngine::init(int opt_level, int codegen_level) {
                 -> llvm::Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
                 auto tm = jtmb.createTargetMachine();
                 if (!tm) return tm.takeError();
-                return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(std::move(*tm), objcache);
+                const char* env = getenv("BCORE_FAST_CG_IR");
+                const unsigned threshold = env ? (unsigned)strtoul(env, nullptr, 10) : 3000;
+                auto fast_builder = jtmb;
+                fast_builder.setCodeGenOptLevel(llvm::CodeGenOpt::None);
+                auto fast = fast_builder.createTargetMachine();
+                if (!fast) return fast.takeError();
+                return std::make_unique<SizeTieredCompiler>(std::move(*tm), std::move(*fast), objcache, threshold);
             })
         .create();
     if (!jit_or_err) {
