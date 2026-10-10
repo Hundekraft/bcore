@@ -68,6 +68,7 @@ int cec_current_ivg();
 // True once after the guest executed IDLE (the block ended there); clears the flag. The host may then let
 // guest time pass, polling devices, until an interrupt is taken.
 bool cec_take_idle();
+bool cec_idle_pending();
 // Current ILAT (latched interrupts, set even while masked in IMASK): IDLE wakes when a new bit latches.
 uint32_t cec_ilat();
 // Current IPEND (levels being serviced, plus global-disable bit 4).

@@ -1,4 +1,5 @@
 #include "core.h"
+#include "mmr.h"
 
 #include <sstream>
 
@@ -6,6 +7,7 @@
 #include "decoder.h"
 #include "disasm_visitor.h"
 #include "jit_engine.h"
+#include "object_pack.h"
 #include "profile_state.h"
 
 #include <llvm/Support/ErrorHandling.h>
@@ -33,6 +35,7 @@ bool Core::init(int opt_level, int codegen_level) {
 
     jit_ = std::make_shared<JitEngine>();
     jit_->set_object_cache_dir(object_cache_dir_);
+    jit_->set_object_pack(pack_.get());
     if (!jit_->init(opt_level_, codegen_level_))
         return false;
     attachProfiler();
@@ -63,6 +66,8 @@ void Core::applyModuleTarget() {
 
 bool Core::run(uint32_t pc) {
     BbFunc fn = jit_->lookup(pc);
+    if (!fn && jit_->try_load_by_bytes(pc, mem_))
+        fn = jit_->lookup(pc);
     if (!fn) {
 #if BCORE_ENABLE_PROFILE
         BcoreEventSink* sink = profile_->sink;
@@ -109,11 +114,14 @@ bool Core::run(uint32_t pc) {
 #if BCORE_ENABLE_PROFILE
         const uint64_t materialize_begin = bcore_profile::monotonic_ns();
 #endif
+        const std::string module_id = result.module->getModuleIdentifier();
         if (jit_->addModule(pc,
                             std::move(result.module),
                             std::move(result.context),
-                            result.fallthrough_pc))
+                            result.fallthrough_pc)) {
             fn = jit_->lookup(pc);
+            if (fn) jit_->record_block_bytes(pc, result.end_pc, result.fallthrough_pc, mem_, module_id);
+        }
 #if BCORE_ENABLE_PROFILE
         const uint64_t t1 = bcore_profile::monotonic_ns();
         fail_on_unwind.armed = false;
@@ -141,6 +149,20 @@ bool Core::run(uint32_t pc) {
     cpu_->packets = 0;
     jit_->set_executing(pc);
     fn(cpu_, mem_);
+    if (chain_budget_) {
+        uint32_t total = cpu_->packets;
+        while (total < chain_budget_ && cpu_->pc == pc && !cpu_->halted && !cec_idle_pending() &&
+               !cec_deliverable(cpu_) && mem_->allow_chain()) {
+            const uint64_t c = ((uint64_t)cpu_->cycles[1] << 32 | cpu_->cycles[0]) + cpu_->packets;
+            cpu_->cycles[0] = (uint32_t)c;
+            cpu_->cycles[1] = cpu_->cycles[2] = (uint32_t)(c >> 32);
+            cpu_->did_jump = false;
+            cpu_->packets = 0;
+            fn(cpu_, mem_);
+            total += cpu_->packets ? cpu_->packets : 1;
+        }
+        cpu_->packets = total;
+    }
     jit_->clear_executing();
 #if BCORE_ENABLE_PROFILE
     profile_->stats.blocks_executed++;
@@ -150,7 +172,20 @@ bool Core::run(uint32_t pc) {
 
 void Core::set_object_cache_dir(const std::string& dir) {
     object_cache_dir_ = dir;
-    if (jit_) jit_->set_object_cache_dir(dir);
+    if (!dir.empty() && !pack_ && jit_) {
+        // Everything besides the guest bytes that decides a block's code: lifter source, JIT settings,
+        // and the memory model the lifter bakes in.
+        translation_salt_ = std::string("bytes-v1|") + BCORE_SOURCE_FINGERPRINT + "|" + jit_->cache_salt() + "|fb=" +
+                            std::to_string(mem_->fast_base()) + "|rl=" + std::to_string(mem_->rawmem_limit()) +
+                            "|fm=" + std::to_string(mem_->is_fastmem()) + "|steps=" + std::to_string(cpu_->steps_remaining);
+        pack_ = std::make_shared<ObjectPack>();
+        pack_->SetSalt(translation_salt_);
+        pack_->Open(dir);
+    }
+    if (jit_) {
+        jit_->set_object_cache_dir(dir);
+        jit_->set_object_pack(pack_.get());
+    }
 }
 
 uint64_t Core::object_cache_hits() const { return cache_hits_base_ + (jit_ ? jit_->cache_hits() : 0); }
@@ -160,6 +195,7 @@ void Core::invalidate() {
     if (jit_) { cache_hits_base_ += jit_->cache_hits(); cache_misses_base_ += jit_->cache_misses(); }
     jit_ = std::make_shared<JitEngine>();
     jit_->set_object_cache_dir(object_cache_dir_);
+    jit_->set_object_pack(pack_.get());
     // Init cannot fail here unless it failed in Core::init already (same host,
     // same levels); if it ever does, stop rather than dereference a null LLJIT.
     if (!jit_->init(opt_level_, codegen_level_))

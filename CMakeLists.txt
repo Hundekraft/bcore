@@ -44,11 +44,24 @@ if(BCORE_PERF_JIT_EVENTS)
 endif()
 
 # ---- Core library (disassembler + emulator) ----
+# Fingerprint of the lifter sources: the JIT cache's byte index (pc + guest bytes -> object) skips
+# lifting, so it must not survive any change to how blocks are lifted. Reconfigures when a source changes.
+file(GLOB BCORE_FINGERPRINT_FILES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/*.h ${CMAKE_CURRENT_SOURCE_DIR}/include/*.h)
+list(SORT BCORE_FINGERPRINT_FILES)
+set(_bcore_fp "")
+foreach(_f ${BCORE_FINGERPRINT_FILES})
+    file(SHA256 ${_f} _h)
+    string(APPEND _bcore_fp ${_h})
+endforeach()
+string(SHA256 BCORE_SOURCE_FINGERPRINT "${_bcore_fp}")
+
 add_library(bfin-core STATIC
     src/core.cpp
     src/disasm_visitor.cpp
     src/lift_visitor.cpp
     src/jit_engine.cpp
+    src/object_pack.cpp
     src/bb_translator.cpp
     src/syscall_emu.cpp
     src/cec.cpp
@@ -57,6 +70,7 @@ add_library(bfin-core STATIC
     src/cpu_state.cpp
     src/profile.cpp
 )
+target_compile_definitions(bfin-core PRIVATE BCORE_SOURCE_FINGERPRINT="${BCORE_SOURCE_FINGERPRINT}")
 target_include_directories(bfin-core
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

@@ -25,6 +25,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
 
+#include "object_pack.h"
 #include "syscall_emu.h"
 #include "cec.h"
 #include "mmr.h"
@@ -35,6 +36,7 @@
 class DiskObjectCache : public llvm::ObjectCache {
 public:
     std::string dir;
+    ObjectPack* pack = nullptr;
 
     static bool keyOf(const llvm::Module* m, std::string& key) {
         const std::string& id = m->getModuleIdentifier();
@@ -47,6 +49,10 @@ public:
     void notifyObjectCompiled(const llvm::Module* m, llvm::MemoryBufferRef obj) override {
         std::string key;
         if (dir.empty() || !keyOf(m, key)) return;
+        if (pack && pack->Enabled()) {
+            pack->AddObject(key, obj.getBufferStart(), obj.getBufferSize());
+            return;
+        }
         // Write to a temp file and rename, so a concurrent reader never sees a partial object.
         const std::string tmp = path(key) + ".tmp" + std::to_string(::getpid());
         std::error_code ec;
@@ -60,6 +66,9 @@ public:
     std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module* m) override {
         std::string key;
         if (dir.empty() || !keyOf(m, key)) return nullptr;
+        if (pack)
+            if (const std::string* o = pack->FindObject(key))
+                return llvm::MemoryBuffer::getMemBufferCopy(*o);
         auto buf = llvm::MemoryBuffer::getFile(path(key), /*IsText=*/false, /*RequiresNullTerminator=*/false);
         if (!buf) return nullptr;
         return std::move(*buf);
@@ -267,9 +276,50 @@ bool JitEngine::tag_cached_module(llvm::Module& mod) {
     std::string key;
     for (uint8_t b : digest) { key += hex[b >> 4]; key += hex[b & 15]; }
     mod.setModuleIdentifier("bcache-" + key);
-    const bool hit = llvm::sys::fs::exists(objcache_->path(key));
+    const bool hit = (objcache_->pack && objcache_->pack->FindObject(key)) || llvm::sys::fs::exists(objcache_->path(key));
     (hit ? cache_hits_ : cache_misses_)++;
     return hit;
+}
+
+void JitEngine::set_object_pack(ObjectPack* pack) { objcache_->pack = pack; }
+
+bool JitEngine::try_load_by_bytes(uint32_t pc, Memory* mem) {
+    ObjectPack* pack = objcache_->pack;
+    if (!pack || !pack->Enabled()) return false;
+    const auto* cands = pack->FindBlocks(pc);
+    if (!cands) return false;
+    for (const auto& b : *cands) {
+        if (pack->HashBytes(mem, pc, b.len) != b.hash) continue;
+        const std::string* obj = pack->FindObject(b.objKey);
+        if (!obj) continue;
+        if (auto err = jit_->addObjectFile(llvm::MemoryBuffer::getMemBufferCopy(*obj))) {
+            llvm::consumeError(std::move(err));
+            return false;
+        }
+        char name[32];
+        snprintf(name, sizeof(name), "bb_0x%08x", pc);
+        auto sym = jit_->lookup(name);
+        if (!sym) {
+            llvm::consumeError(sym.takeError());
+            return false;
+        }
+        cache_[pc] = BBInfo{reinterpret_cast<BbFunc>(sym->getValue()), b.fallthrough};
+        ++cache_hits_;
+        return true;
+    }
+    return false;
+}
+
+void JitEngine::record_block_bytes(uint32_t pc, uint32_t end_pc, uint32_t fallthrough_pc, Memory* mem,
+                                   const std::string& module_id) {
+    ObjectPack* pack = objcache_->pack;
+    if (!pack || !pack->Enabled() || module_id.rfind("bcache-", 0) != 0 || end_pc <= pc) return;
+    ObjectPack::BlockBytes b;
+    b.len = end_pc - pc;
+    b.fallthrough = fallthrough_pc;
+    b.hash = pack->HashBytes(mem, pc, b.len);
+    b.objKey = module_id.substr(7);
+    if (pack->FindObject(b.objKey)) pack->AddBlock(pc, b);
 }
 
 BbFunc JitEngine::lookup(uint32_t pc) {

@@ -12,6 +12,7 @@
 
 class JitEngine;
 class BBTranslator;
+class ObjectPack;
 
 namespace bcore_profile { struct ProfileState; }
 
@@ -31,6 +32,11 @@ public:
     // Persistent JIT object cache directory (see JitEngine::set_object_cache_dir); "" disables it.
     // Kept across invalidate(). Call any time; applies to blocks translated from then on.
     void set_object_cache_dir(const std::string& dir);
+    // Up to this many packets per run(): a block whose exit jumps back to its own start (hardware-loop
+    // iteration, tight polling loop) runs again directly, advancing CYCLES as the host would between
+    // blocks. Stops on any other pc, halt, IDLE, a deliverable interrupt, or !Memory::allow_chain().
+    // 0 (default) = one block per run().
+    void set_chain_budget(uint32_t packets) { chain_budget_ = packets; }
     uint64_t object_cache_hits() const;
     uint64_t object_cache_misses() const;
 
@@ -82,6 +88,9 @@ private:
     std::shared_ptr<BBTranslator> translator_;
     int opt_level_ = 2;
     std::string object_cache_dir_;
+    std::shared_ptr<ObjectPack> pack_;
+    std::string translation_salt_;
+    uint32_t chain_budget_ = 0;
     uint64_t cache_hits_base_ = 0, cache_misses_base_ = 0;
     int codegen_level_ = -1;
     bool dump_ir_ = false;

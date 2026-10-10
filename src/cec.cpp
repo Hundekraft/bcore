@@ -504,6 +504,8 @@ bool cec_deliverable(CpuState* cpu) {
 }
 bool cec_pending() { return s_cec_pending; }
 
+bool cec_idle_pending() { return s_idle; }
+
 bool cec_take_idle() {
     const bool idle = s_idle;
     s_idle = false;

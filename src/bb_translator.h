@@ -14,6 +14,7 @@ struct BBTranslateResult {
     std::unique_ptr<llvm::Module> module;
     std::unique_ptr<llvm::LLVMContext> context;
     uint32_t fallthrough_pc;
+    uint32_t end_pc = 0;  // guest code bytes [pc, end_pc) were decoded for this block
 };
 
 class BBTranslator {

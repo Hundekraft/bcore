@@ -32,6 +32,11 @@ public:
     // value can be accessed directly via fast_base() + addr without an extern call.
     // Returns 0 in fastmem mode (not needed there).
     virtual uint32_t rawmem_limit() const { return is_fastmem() ? 0u : (base() + size()); }
+
+    // Core::run may re-run a block that jumps back to its own start without returning to the host
+    // (see Core::set_chain_budget). A host returns false once something it must react to between blocks
+    // happened during the block, e.g. an MMR access.
+    virtual bool allow_chain() const { return true; }
 };
 
 // extern "C" wrappers for JIT-generated code

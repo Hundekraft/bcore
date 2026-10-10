@@ -17,6 +17,7 @@
 
 namespace llvm { class TargetMachine; class JITEventListener; }
 class DiskObjectCache;
+class ObjectPack;
 
 // Function signature for JIT'd basic block functions
 using BbFunc = void (*)(CpuState*, Memory*);
@@ -56,10 +57,19 @@ public:
     // block's unoptimized bitcode plus the compile settings, LLVM version and host CPU. Empty dir disables it.
     // A key can only match identical input, so a hit never changes behavior, it only skips optimize+codegen.
     void set_object_cache_dir(const std::string& dir);
+    // Objects and the byte index live in this pack (owned by Core, shared across invalidate()).
+    void set_object_pack(ObjectPack* pack);
+    // Load pc's block straight from the pack when guest memory still holds the bytes it was lifted
+    // from (no lifting, no bitcode). Returns true and caches the block on success.
+    bool try_load_by_bytes(uint32_t pc, Memory* mem);
+    // After a translation: remember which bytes the module tagged by tag_cached_module came from.
+    void record_block_bytes(uint32_t pc, uint32_t end_pc, uint32_t fallthrough_pc, Memory* mem,
+                            const std::string& module_id);
     // Names the module by its cache key. Returns true when the object is already cached; the caller then
     // skips optimize_module (addModule loads the cached object instead of compiling).
     bool tag_cached_module(llvm::Module& mod);
     uint64_t cache_hits() const { return cache_hits_; }
+    const std::string& cache_salt() const { return cache_salt_; }
     uint64_t cache_misses() const { return cache_misses_; }
     void set_executing(uint32_t pc) { executing_bb_pc_ = pc; }
     void clear_executing()          { executing_bb_pc_ = 0; }
