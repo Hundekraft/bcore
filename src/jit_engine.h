@@ -16,6 +16,7 @@
 #include "mem.h"
 
 namespace llvm { class TargetMachine; class JITEventListener; }
+class DiskObjectCache;
 
 // Function signature for JIT'd basic block functions
 using BbFunc = void (*)(CpuState*, Memory*);
@@ -50,6 +51,16 @@ public:
                    std::unique_ptr<llvm::LLVMContext> ctx,
                    uint32_t fallthrough_pc);
     BbFunc lookup(uint32_t pc);
+
+    // Persistent object cache: compiled blocks are stored as object files in dir, keyed by a SHA-256 of the
+    // block's unoptimized bitcode plus the compile settings, LLVM version and host CPU. Empty dir disables it.
+    // A key can only match identical input, so a hit never changes behavior, it only skips optimize+codegen.
+    void set_object_cache_dir(const std::string& dir);
+    // Names the module by its cache key. Returns true when the object is already cached; the caller then
+    // skips optimize_module (addModule loads the cached object instead of compiling).
+    bool tag_cached_module(llvm::Module& mod);
+    uint64_t cache_hits() const { return cache_hits_; }
+    uint64_t cache_misses() const { return cache_misses_; }
     void set_executing(uint32_t pc) { executing_bb_pc_ = pc; }
     void clear_executing()          { executing_bb_pc_ = 0; }
 
@@ -72,6 +83,9 @@ public:
     }
 
 private:
+    std::unique_ptr<DiskObjectCache> objcache_;  // declared before jit_: the compiler holds a pointer to it
+    std::string cache_salt_;
+    uint64_t cache_hits_ = 0, cache_misses_ = 0;
     std::unique_ptr<llvm::orc::LLJIT> jit_;
     std::unordered_map<uint32_t, BBInfo> cache_;
     int opt_level_ = 2;

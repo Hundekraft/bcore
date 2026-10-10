@@ -2,8 +2,18 @@
 
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Config/llvm-config.h>
+#include <llvm/ExecutionEngine/ObjectCache.h>
+#include <llvm/ExecutionEngine/Orc/CompileUtils.h>
+#include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/SHA256.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
@@ -19,7 +29,43 @@
 #include "cec.h"
 #include "cpu_state.h"
 
-JitEngine::JitEngine() = default;
+// Object files on disk, one per block, named <key>.o. Only modules tagged by tag_cached_module (identifier
+// "bcache-<key>") take part; anything else compiles normally and is not stored.
+class DiskObjectCache : public llvm::ObjectCache {
+public:
+    std::string dir;
+
+    static bool keyOf(const llvm::Module* m, std::string& key) {
+        const std::string& id = m->getModuleIdentifier();
+        if (id.rfind("bcache-", 0) != 0) return false;
+        key = id.substr(7);
+        return true;
+    }
+    std::string path(const std::string& key) const { return dir + "/" + key + ".o"; }
+
+    void notifyObjectCompiled(const llvm::Module* m, llvm::MemoryBufferRef obj) override {
+        std::string key;
+        if (dir.empty() || !keyOf(m, key)) return;
+        // Write to a temp file and rename, so a concurrent reader never sees a partial object.
+        const std::string tmp = path(key) + ".tmp" + std::to_string(::getpid());
+        std::error_code ec;
+        {
+            llvm::raw_fd_ostream os(tmp, ec, llvm::sys::fs::OF_None);
+            if (ec) return;
+            os << obj.getBuffer();
+        }
+        if (llvm::sys::fs::rename(tmp, path(key))) llvm::sys::fs::remove(tmp);
+    }
+    std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module* m) override {
+        std::string key;
+        if (dir.empty() || !keyOf(m, key)) return nullptr;
+        auto buf = llvm::MemoryBuffer::getFile(path(key), /*IsText=*/false, /*RequiresNullTerminator=*/false);
+        if (!buf) return nullptr;
+        return std::move(*buf);
+    }
+};
+
+JitEngine::JitEngine() : objcache_(std::make_unique<DiskObjectCache>()) {}
 JitEngine::~JitEngine() = default;
 
 // Helper to create a JITEvaluatedSymbol from a function pointer
@@ -75,8 +121,22 @@ bool JitEngine::init(int opt_level, int codegen_level) {
     tuning.SLPVectorization = opt_level >= 2;
     pb_ = std::make_unique<llvm::PassBuilder>(pass_machine_.get(), tuning);
 
+    // Everything besides the bitcode that decides the generated code goes into the cache key.
+    cache_salt_ = std::string("bcore-objcache-v1|") + LLVM_VERSION_STRING + "|" +
+                  jtmb_or_err->getTargetTriple().str() + "|" + jtmb_or_err->getCPU() + "|" +
+                  jtmb_or_err->getFeatures().getString() + "|O" + std::to_string(opt_level) + "|CG" +
+                  std::to_string(cg);
+
+    DiskObjectCache* objcache = objcache_.get();
     auto jit_or_err = llvm::orc::LLJITBuilder()
         .setJITTargetMachineBuilder(std::move(*jtmb_or_err))
+        .setCompileFunctionCreator(
+            [objcache](llvm::orc::JITTargetMachineBuilder jtmb)
+                -> llvm::Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+                auto tm = jtmb.createTargetMachine();
+                if (!tm) return tm.takeError();
+                return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(std::move(*tm), objcache);
+            })
         .create();
     if (!jit_or_err) {
         llvm::errs() << "Failed to create LLJIT: " << jit_or_err.takeError() << "\n";
@@ -183,6 +243,31 @@ bool JitEngine::addModule(uint32_t pc, std::unique_ptr<llvm::Module> module,
     auto fn = reinterpret_cast<BbFunc>(sym->getValue());
     cache_[pc] = BBInfo{fn, fallthrough_pc};
     return true;
+}
+
+void JitEngine::set_object_cache_dir(const std::string& dir) {
+    objcache_->dir = dir;
+    if (!dir.empty()) llvm::sys::fs::create_directories(dir);
+}
+
+bool JitEngine::tag_cached_module(llvm::Module& mod) {
+    if (objcache_->dir.empty()) return false;
+    llvm::SmallVector<char, 0> bc;
+    {
+        llvm::raw_svector_ostream os(bc);
+        llvm::WriteBitcodeToFile(mod, os);
+    }
+    llvm::SHA256 sha;
+    sha.update(cache_salt_);
+    sha.update(llvm::StringRef(bc.data(), bc.size()));
+    const auto digest = sha.final();
+    static const char* hex = "0123456789abcdef";
+    std::string key;
+    for (uint8_t b : digest) { key += hex[b >> 4]; key += hex[b & 15]; }
+    mod.setModuleIdentifier("bcache-" + key);
+    const bool hit = llvm::sys::fs::exists(objcache_->path(key));
+    (hit ? cache_hits_ : cache_misses_)++;
+    return hit;
 }
 
 BbFunc JitEngine::lookup(uint32_t pc) {

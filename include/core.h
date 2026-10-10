@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <tuple>
 
 #include "bcore_profile.h"
@@ -27,6 +28,11 @@ public:
     bool run(uint32_t pc);
     std::tuple<std::string, uint32_t> disassemble(uint32_t pc);
     void set_dump_ir(bool enable);
+    // Persistent JIT object cache directory (see JitEngine::set_object_cache_dir); "" disables it.
+    // Kept across invalidate(). Call any time; applies to blocks translated from then on.
+    void set_object_cache_dir(const std::string& dir);
+    uint64_t object_cache_hits() const;
+    uint64_t object_cache_misses() const;
 
     // ---- JIT observability (contract in bcore_profile.h) ----
 
@@ -75,6 +81,8 @@ private:
     std::shared_ptr<JitEngine> jit_;
     std::shared_ptr<BBTranslator> translator_;
     int opt_level_ = 2;
+    std::string object_cache_dir_;
+    uint64_t cache_hits_base_ = 0, cache_misses_base_ = 0;
     int codegen_level_ = -1;
     bool dump_ir_ = false;
 };

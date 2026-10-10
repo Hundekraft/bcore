@@ -32,6 +32,7 @@ bool Core::init(int opt_level, int codegen_level) {
     codegen_level_ = codegen_level;
 
     jit_ = std::make_shared<JitEngine>();
+    jit_->set_object_cache_dir(object_cache_dir_);
     if (!jit_->init(opt_level_, codegen_level_))
         return false;
     attachProfiler();
@@ -92,7 +93,9 @@ bool Core::run(uint32_t pc) {
         // the IR that is compiled. It used to run only inside the dump branch:
         // from the initial commit on, a nonzero opt_level changed the printed IR
         // and never the executed code.
-        if (opt_level_ != 0) {
+        // A cached object skips the IR pipeline and codegen: addModule loads it.
+        const bool cached = jit_->tag_cached_module(*result.module);
+        if (opt_level_ != 0 && !cached) {
             jit_->optimize_module(*result.module);
 #if BCORE_ENABLE_PROFILE
             optimize_end = bcore_profile::monotonic_ns();
@@ -145,8 +148,18 @@ bool Core::run(uint32_t pc) {
     return true;
 }
 
+void Core::set_object_cache_dir(const std::string& dir) {
+    object_cache_dir_ = dir;
+    if (jit_) jit_->set_object_cache_dir(dir);
+}
+
+uint64_t Core::object_cache_hits() const { return cache_hits_base_ + (jit_ ? jit_->cache_hits() : 0); }
+uint64_t Core::object_cache_misses() const { return cache_misses_base_ + (jit_ ? jit_->cache_misses() : 0); }
+
 void Core::invalidate() {
+    if (jit_) { cache_hits_base_ += jit_->cache_hits(); cache_misses_base_ += jit_->cache_misses(); }
     jit_ = std::make_shared<JitEngine>();
+    jit_->set_object_cache_dir(object_cache_dir_);
     // Init cannot fail here unless it failed in Core::init already (same host,
     // same levels); if it ever does, stop rather than dereference a null LLJIT.
     if (!jit_->init(opt_level_, codegen_level_))
