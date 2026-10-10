@@ -11,8 +11,9 @@
 class Memory;
 
 struct BBTranslateResult {
-    std::unique_ptr<llvm::Module> module;
+    // context before module: members are destroyed in reverse order, and a Module must go before its context.
     std::unique_ptr<llvm::LLVMContext> context;
+    std::unique_ptr<llvm::Module> module;
     uint32_t fallthrough_pc;
     uint32_t end_pc = 0;  // guest code bytes [pc, end_pc) were decoded for this block
 };

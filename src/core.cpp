@@ -25,7 +25,11 @@ Core::Core(CpuState* cpu, Memory* mem)
 #endif
 }
 
-Core::~Core() = default;
+Core::~Core() {
+    // The JIT engine's compile worker uses translator_ and pack_: stop it (by destroying the engine) before
+    // members declared after jit_ go away.
+    jit_.reset();
+}
 
 void Core::attachProfiler() {
 #if BCORE_ENABLE_PROFILE
@@ -77,11 +81,17 @@ void Core::set_async_compile(bool on) {
 // the CPU thread before it starts). Guest code bytes are read from the worker; R246 does not rewrite code
 // in place, and install_compiled() drops a block whose bytes changed since the lift.
 void Core::start_async_worker() {
+    const char* env = getenv("BCORE_COMPILE_THREADS");
+    const unsigned threads = env ? (unsigned)strtoul(env, nullptr, 10) : 3;
     jit_->start_worker([this](uint32_t pc, JitEngine::CompileJob& job) {
         // The CPU may be writing this code right now (the boot loader copies stages in while running):
         // a block is only valid when its bytes were the same before and after the lift.
         const uint64_t before = hash_code(pc, pc + 2048);
-        auto result = translator_->translate(pc);
+        BBTranslateResult result;
+        {
+            std::lock_guard<std::mutex> lock(lift_mu_);   // one translator, several workers
+            result = translator_->translate(pc);
+        }
         if (!result.module) return false;
         if (hash_code(pc, pc + 2048) != before) return false;
         job.end_pc = result.end_pc;
@@ -90,7 +100,7 @@ void Core::start_async_worker() {
         job.context = std::move(result.context);
         job.module = std::move(result.module);
         return true;
-    });
+    }, threads);
 }
 
 uint64_t Core::hash_code(uint32_t pc, uint32_t end_pc) const {
@@ -117,6 +127,13 @@ bool Core::run_impl(uint32_t pc, bool may_defer) {
     not_ready_ = false;
     if (async_) install_compiled();
     BbFunc fn = jit_->lookup(pc);
+    if (!fn && async_ && may_defer && jit_->is_pending(pc)) {   // fast path: still compiling
+        // A block the host keeps arriving at is hot: compile it next.
+        const uint32_t hits = ++pending_hits_[pc];
+        if ((hits & (hits - 1)) == 0 && hits >= 2) jit_->prioritize(pc);
+        not_ready_ = true;
+        return false;
+    }
     if (!fn && jit_->try_load_by_bytes(pc, mem_))
         fn = jit_->lookup(pc);
     if (!fn && async_) {
@@ -130,7 +147,7 @@ bool Core::run_impl(uint32_t pc, bool may_defer) {
             if (may_defer) {
                 // A block the host keeps arriving at is hot: compile it next.
                 const uint32_t hits = ++pending_hits_[pc];
-                if ((hits & (hits - 1)) == 0 && hits >= 4) jit_->prioritize(pc);
+                if ((hits & (hits - 1)) == 0 && hits >= 2) jit_->prioritize(pc);
                 not_ready_ = true;
                 return false;
             }

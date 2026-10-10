@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -112,5 +113,6 @@ private:
     bool dump_ir_ = false;
     bool async_ = false;
     bool not_ready_ = false;
-    std::unordered_map<uint32_t, uint32_t> pending_hits_;   // async: times the host arrived at a compiling block
+    std::unordered_map<uint32_t, uint32_t> pending_hits_;
+    std::mutex lift_mu_;   // async: times the host arrived at a compiling block
 };

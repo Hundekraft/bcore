@@ -80,20 +80,20 @@ public:
 
 JitEngine::JitEngine() : objcache_(std::make_unique<DiskObjectCache>()) {}
 JitEngine::~JitEngine() {
-    if (worker_.joinable()) {
+    if (!workers_.empty()) {
         {
             std::lock_guard<std::mutex> lock(queue_mu_);
             stop_ = true;
         }
         queue_cv_.notify_all();
-        worker_.join();
+        for (auto& w : workers_) w.join();
     }
 }
 
-void JitEngine::start_worker(Lifter lifter) {
-    if (worker_.joinable()) return;
+void JitEngine::start_worker(Lifter lifter, unsigned count) {
+    if (!workers_.empty()) return;
     lifter_ = std::move(lifter);
-    worker_ = std::thread([this] { worker_loop(); });
+    for (unsigned i = 0; i < std::max(1u, count); ++i) workers_.emplace_back([this] { worker_loop(); });
 }
 
 void JitEngine::enqueue(CompileJob job) {
@@ -189,24 +189,52 @@ namespace {
 // backend at CodeGenOpt::Default, and every compile stalls the guest. Those use the fast backend
 // (CodeGenOpt::None: FastISel, fast register allocation); everything else keeps the configured level. The
 // choice depends only on the optimized module, so it is reproducible and the object cache stays valid.
-// BCORE_FAST_CG_IR=N sets the IR instruction threshold (0 = off).
+// BCORE_FAST_CG_IR=N sets the IR instruction threshold (default 1500, 0 = off).
 class SizeTieredCompiler : public llvm::orc::IRCompileLayer::IRCompiler {
 public:
-    SizeTieredCompiler(std::unique_ptr<llvm::TargetMachine> normal, std::unique_ptr<llvm::TargetMachine> fast,
+    // Compiles on whichever thread materializes (async compile runs several workers), so each thread gets its
+    // own TargetMachines: they are not safe to share.
+    SizeTieredCompiler(llvm::orc::JITTargetMachineBuilder jtmb, const llvm::TargetOptions& options,
                        llvm::ObjectCache* cache, unsigned threshold)
-        : IRCompiler(llvm::orc::irManglingOptionsFromTargetOptions(normal->Options)),
-          normal_tm_(std::move(normal)), fast_tm_(std::move(fast)),
-          normal_(*normal_tm_, cache), fast_(*fast_tm_, cache), threshold_(threshold) {}
+        : IRCompiler(llvm::orc::irManglingOptionsFromTargetOptions(options)),
+          jtmb_(std::move(jtmb)), cache_(cache), threshold_(threshold) {}
 
     llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> operator()(llvm::Module& m) override {
-        if (threshold_ && m.getInstructionCount() > threshold_) return fast_(m);
-        return normal_(m);
+        auto per = get();
+        if (!per) return per.takeError();
+        if (threshold_ && m.getInstructionCount() > threshold_) return (*(*per)->fast)(m);
+        return (*(*per)->normal)(m);
     }
 
 private:
-    std::unique_ptr<llvm::TargetMachine> normal_tm_, fast_tm_;
-    llvm::orc::SimpleCompiler normal_, fast_;
+    struct PerThread {
+        std::unique_ptr<llvm::TargetMachine> normal_tm, fast_tm;
+        std::unique_ptr<llvm::orc::SimpleCompiler> normal, fast;
+    };
+    llvm::Expected<PerThread*> get() {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto& p = per_[std::this_thread::get_id()];
+        if (!p) {
+            auto n = jtmb_.createTargetMachine();
+            if (!n) return n.takeError();
+            auto fb = jtmb_;
+            fb.setCodeGenOptLevel(llvm::CodeGenOpt::None);
+            auto f = fb.createTargetMachine();
+            if (!f) return f.takeError();
+            auto pt = std::make_unique<PerThread>();
+            pt->normal_tm = std::move(*n);
+            pt->fast_tm = std::move(*f);
+            pt->normal = std::make_unique<llvm::orc::SimpleCompiler>(*pt->normal_tm, cache_);
+            pt->fast = std::make_unique<llvm::orc::SimpleCompiler>(*pt->fast_tm, cache_);
+            p = std::move(pt);
+        }
+        return p.get();
+    }
+    llvm::orc::JITTargetMachineBuilder jtmb_;
+    llvm::ObjectCache* cache_;
     unsigned threshold_;
+    std::mutex mu_;
+    std::unordered_map<std::thread::id, std::unique_ptr<PerThread>> per_;
 };
 }  // namespace
 
@@ -255,6 +283,8 @@ bool JitEngine::init(int opt_level, int codegen_level) {
     tuning.LoopInterleaving = opt_level >= 2;
     tuning.SLPVectorization = opt_level >= 2;
     pb_ = std::make_unique<llvm::PassBuilder>(pass_machine_.get(), tuning);
+    jtmb_ = std::make_unique<llvm::orc::JITTargetMachineBuilder>(*jtmb_or_err);
+    owner_thread_ = std::this_thread::get_id();
 
     // Everything besides the bitcode that decides the generated code goes into the cache key.
     cache_salt_ = std::string("bcore-objcache-v1|") + LLVM_VERSION_STRING + "|" +
@@ -271,12 +301,8 @@ bool JitEngine::init(int opt_level, int codegen_level) {
                 auto tm = jtmb.createTargetMachine();
                 if (!tm) return tm.takeError();
                 const char* env = getenv("BCORE_FAST_CG_IR");
-                const unsigned threshold = env ? (unsigned)strtoul(env, nullptr, 10) : 3000;
-                auto fast_builder = jtmb;
-                fast_builder.setCodeGenOptLevel(llvm::CodeGenOpt::None);
-                auto fast = fast_builder.createTargetMachine();
-                if (!fast) return fast.takeError();
-                return std::make_unique<SizeTieredCompiler>(std::move(*tm), std::move(*fast), objcache, threshold);
+                const unsigned threshold = env ? (unsigned)strtoul(env, nullptr, 10) : 1500;
+                return std::make_unique<SizeTieredCompiler>(jtmb, (*tm)->Options, objcache, threshold);
             })
         .create();
     if (!jit_or_err) {
@@ -335,6 +361,25 @@ bool JitEngine::init(int opt_level, int codegen_level) {
 
 void JitEngine::optimize_module(llvm::Module& mod) {
     if (opt_level_ == 0) return;
+    // Compile workers each get their own pass TargetMachine and PassBuilder (neither is thread-safe).
+    llvm::TargetMachine* machine = pass_machine_.get();
+    llvm::PassBuilder* pb = pb_.get();
+    if (std::this_thread::get_id() != owner_thread_) {
+        std::lock_guard<std::mutex> lock(pass_mu_);
+        auto& wp = worker_passes_[std::this_thread::get_id()];
+        if (!wp.machine) {
+            auto m = llvm::orc::JITTargetMachineBuilder(*jtmb_).createTargetMachine();
+            if (!m) { llvm::consumeError(m.takeError()); return; }
+            wp.machine = std::move(*m);
+            llvm::PipelineTuningOptions tuning;
+            tuning.LoopVectorization = opt_level_ >= 2;
+            tuning.LoopInterleaving = opt_level_ >= 2;
+            tuning.SLPVectorization = opt_level_ >= 2;
+            wp.pb = std::make_unique<llvm::PassBuilder>(wp.machine.get(), tuning);
+        }
+        machine = wp.machine.get();
+        pb = wp.pb.get();
+    }
 
     llvm::OptimizationLevel lvl =
         opt_level_ == 1 ? llvm::OptimizationLevel::O1 :
@@ -349,16 +394,16 @@ void JitEngine::optimize_module(llvm::Module& mod) {
     // PassBuilder(TM) registers the same TargetIRAnalysis itself; registering
     // it first makes that explicit (the later default registration is then a
     // no-op).
-    fam.registerPass([&] { return pass_machine_->getTargetIRAnalysis(); });
-    pb_->registerModuleAnalyses(mam);
-    pb_->registerCGSCCAnalyses(cgam);
-    pb_->registerFunctionAnalyses(fam);
-    pb_->registerLoopAnalyses(lam);
-    pb_->crossRegisterProxies(lam, fam, cgam, mam);
+    fam.registerPass([&] { return machine->getTargetIRAnalysis(); });
+    pb->registerModuleAnalyses(mam);
+    pb->registerCGSCCAnalyses(cgam);
+    pb->registerFunctionAnalyses(fam);
+    pb->registerLoopAnalyses(lam);
+    pb->crossRegisterProxies(lam, fam, cgam, mam);
 
     // Rebuild per-module pipeline each call (analysis managers are fresh).
     // passBuilder itself is reused across calls (avoids plugin registration overhead).
-    llvm::ModulePassManager mpm = pb_->buildPerModuleDefaultPipeline(lvl);
+    llvm::ModulePassManager mpm = pb->buildPerModuleDefaultPipeline(lvl);
     mpm.run(mod, mam);
 }
 

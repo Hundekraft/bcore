@@ -116,5 +116,5 @@ BBTranslateResult BBTranslator::translate(uint32_t pc) {
                 fname, err_str.c_str());
     }
 
-    return {std::move(mod), std::move(ctx), visitor.fallthrough_pc(), cur_pc};
+    return {std::move(ctx), std::move(mod), visitor.fallthrough_pc(), cur_pc};
 }

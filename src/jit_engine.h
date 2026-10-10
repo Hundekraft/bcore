@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -96,8 +97,8 @@ public:
     // Lifts pc into job (module, context, end_pc, fallthrough_pc, bytes_hash, module_id); runs on the worker for
     // jobs queued without a module. Returns false when the block cannot be lifted.
     using Lifter = std::function<bool(uint32_t pc, CompileJob& job)>;
-    void start_worker(Lifter lifter);
-    bool worker_running() const { return worker_.joinable(); }
+    void start_worker(Lifter lifter, unsigned count = 1);
+    bool worker_running() const { return !workers_.empty(); }
     bool is_pending(uint32_t pc) const { return pending_.count(pc) != 0; }   // CPU thread only
     void enqueue(CompileJob job);                                            // CPU thread only
     // Blocks until the job for pc has finished (CPU thread); moves it to the front of the queue first.
@@ -145,7 +146,13 @@ private:
     BbFunc materialize(uint32_t pc, std::unique_ptr<llvm::Module> module, std::unique_ptr<llvm::LLVMContext> ctx);
     void worker_loop();
     Lifter lifter_;
-    std::thread worker_;
+    std::vector<std::thread> workers_;
+    // Per-worker IR pipelines (optimize_module from a thread other than the one that ran init()).
+    struct WorkerPasses { std::unique_ptr<llvm::TargetMachine> machine; std::unique_ptr<llvm::PassBuilder> pb; };
+    std::unique_ptr<llvm::orc::JITTargetMachineBuilder> jtmb_;
+    std::thread::id owner_thread_;
+    std::mutex pass_mu_;
+    std::unordered_map<std::thread::id, WorkerPasses> worker_passes_;
     std::mutex queue_mu_;
     std::condition_variable queue_cv_, done_cv_;
     std::deque<CompileJob> queue_;
