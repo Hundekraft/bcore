@@ -1,4 +1,4 @@
-#include <elf.h>
+#include "elf_compat.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

@@ -1,4 +1,4 @@
-#include <elf.h>
+#include "elf_compat.h"
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
