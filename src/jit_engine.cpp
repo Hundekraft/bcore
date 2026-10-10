@@ -71,6 +71,8 @@ public:
                 return llvm::MemoryBuffer::getMemBufferCopy(*o);
         auto buf = llvm::MemoryBuffer::getFile(path(key), /*IsText=*/false, /*RequiresNullTerminator=*/false);
         if (!buf) return nullptr;
+        // Older caches kept one file per object: move hits into the pack so the byte index can use them.
+        if (pack && pack->Enabled()) pack->AddObject(key, (*buf)->getBufferStart(), (*buf)->getBufferSize());
         return std::move(*buf);
     }
 };
