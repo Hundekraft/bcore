@@ -93,22 +93,26 @@ void ObjectPack::Append(char type, const std::string& key, const char* data, siz
 }
 
 const std::string* ObjectPack::FindObject(const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mu_);
     auto it = objects_.find(key);
     return it == objects_.end() ? nullptr : &it->second;
 }
 
 void ObjectPack::AddObject(const std::string& key, const char* data, size_t size) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (fd_ < 0 || objects_.count(key)) return;
     objects_.emplace(key, std::string(data, size));
     Append('O', key, data, size);
 }
 
 const std::vector<ObjectPack::BlockBytes>* ObjectPack::FindBlocks(uint32_t pc) const {
+    std::lock_guard<std::mutex> lock(mu_);
     auto it = blocks_.find(pc);
     return it == blocks_.end() ? nullptr : &it->second;
 }
 
 void ObjectPack::AddBlock(uint32_t pc, const BlockBytes& b) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (fd_ < 0) return;
     for (const auto& e : blocks_[pc])
         if (e.len == b.len && e.hash == b.hash && e.objKey == b.objKey) return;

@@ -1,3 +1,4 @@
+#include <llvm/Support/xxhash.h>
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
@@ -67,10 +68,78 @@ void Core::applyModuleTarget() {
     translator_->setModuleTarget(jit_->dataLayout(), jit_->targetTriple());
 }
 
-bool Core::run(uint32_t pc) {
+void Core::set_async_compile(bool on) {
+    async_ = on;
+    if (on && jit_) start_async_worker();
+}
+
+// The worker lifts too: the translator is only used from the worker while async compile is on (and from
+// the CPU thread before it starts). Guest code bytes are read from the worker; R246 does not rewrite code
+// in place, and install_compiled() drops a block whose bytes changed since the lift.
+void Core::start_async_worker() {
+    jit_->start_worker([this](uint32_t pc, JitEngine::CompileJob& job) {
+        // The CPU may be writing this code right now (the boot loader copies stages in while running):
+        // a block is only valid when its bytes were the same before and after the lift.
+        const uint64_t before = hash_code(pc, pc + 2048);
+        auto result = translator_->translate(pc);
+        if (!result.module) return false;
+        if (hash_code(pc, pc + 2048) != before) return false;
+        job.end_pc = result.end_pc;
+        job.fallthrough_pc = result.fallthrough_pc;
+        job.bytes_hash = hash_code(pc, result.end_pc);
+        job.context = std::move(result.context);
+        job.module = std::move(result.module);
+        return true;
+    });
+}
+
+uint64_t Core::hash_code(uint32_t pc, uint32_t end_pc) const {
+    std::string bytes;
+    bytes.reserve(end_pc > pc ? end_pc - pc : 0);
+    for (uint32_t a = pc; a < end_pc; ++a) bytes.push_back((char)mem_->read8(a));
+    return llvm::xxHash64(bytes);
+}
+
+// Installs blocks the worker finished, unless their guest code changed since they were lifted.
+void Core::install_compiled() {
+    for (auto& d : jit_->take_compiled()) {
+        pending_hits_.erase(d.pc);
+        if (!d.fn || hash_code(d.pc, d.end_pc) != d.bytes_hash) continue;
+        jit_->install(d.pc, d.fn, d.fallthrough_pc);
+        jit_->record_block_bytes(d.pc, d.end_pc, d.fallthrough_pc, mem_, d.module_id);
+    }
+}
+
+bool Core::run(uint32_t pc) { return run_impl(pc, async_); }
+bool Core::run_sync(uint32_t pc) { return run_impl(pc, false); }
+
+bool Core::run_impl(uint32_t pc, bool may_defer) {
+    not_ready_ = false;
+    if (async_) install_compiled();
     BbFunc fn = jit_->lookup(pc);
     if (!fn && jit_->try_load_by_bytes(pc, mem_))
         fn = jit_->lookup(pc);
+    if (!fn && async_) {
+        if (!jit_->is_pending(pc)) {
+            JitEngine::CompileJob job;   // no module: the worker lifts it (see start_async_worker)
+            job.pc = pc;
+            jit_->enqueue(std::move(job));
+            ++translate_count_;
+        }
+        if (!fn) {
+            if (may_defer) {
+                // A block the host keeps arriving at is hot: compile it next.
+                const uint32_t hits = ++pending_hits_[pc];
+                if ((hits & (hits - 1)) == 0 && hits >= 4) jit_->prioritize(pc);
+                not_ready_ = true;
+                return false;
+            }
+            jit_->wait_for(pc);
+            install_compiled();
+            fn = jit_->lookup(pc);
+            if (!fn) return false;
+        }
+    }
     if (!fn) {
         const auto host_t0 = std::chrono::steady_clock::now();
         struct AddTime {
@@ -226,6 +295,8 @@ void Core::invalidate() {
     if (!jit_->init(opt_level_, codegen_level_))
         llvm::report_fatal_error("bcore: JIT re-initialization failed in invalidate()");
     applyModuleTarget();
+    pending_hits_.clear();
+    if (async_) start_async_worker();
 #if BCORE_ENABLE_PROFILE
     // The old engine's objects are gone; drop their map entries before the
     // host can observe stale addresses, then re-arm the listeners (including

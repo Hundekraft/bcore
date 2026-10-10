@@ -9,6 +9,7 @@
 // write() each with O_APPEND, so concurrent emulator processes only ever add whole records.
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +48,9 @@ private:
 
     int fd_ = -1;
     std::string salt_;
+    // Objects are added by the async compile worker (notifyObjectCompiled) while the CPU thread looks them up.
+    // Elements of objects_ are node-stable, so FindObject's pointer stays valid after the lock is released.
+    mutable std::mutex mu_;
     std::unordered_map<std::string, std::string> objects_;
     std::unordered_map<uint32_t, std::vector<BlockBytes>> blocks_;
 };

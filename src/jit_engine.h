@@ -1,7 +1,14 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,6 +75,39 @@ public:
     // Names the module by its cache key. Returns true when the object is already cached; the caller then
     // skips optimize_module (addModule loads the cached object instead of compiling).
     bool tag_cached_module(llvm::Module& mod);
+    // ---- Asynchronous compilation (one worker thread) ----
+    // A lifted, uncached block: the worker optimizes and compiles it while the host runs the code some
+    // other way (op1emu interprets it). All IR optimization and codegen then happens on the worker, so
+    // the single-threaded pass pipeline is never used from two threads.
+    struct CompileJob {
+        uint32_t pc = 0, end_pc = 0, fallthrough_pc = 0;
+        uint64_t bytes_hash = 0;    // guest code bytes [pc, end_pc) when lifted
+        std::string module_id;
+        // context before module: members are destroyed in reverse order, and a Module must go before its context.
+        std::unique_ptr<llvm::LLVMContext> context;
+        std::unique_ptr<llvm::Module> module;
+    };
+    struct CompiledBlock {
+        uint32_t pc = 0, end_pc = 0, fallthrough_pc = 0;
+        uint64_t bytes_hash = 0;
+        std::string module_id;
+        BbFunc fn = nullptr;        // nullptr: compile failed
+    };
+    // Lifts pc into job (module, context, end_pc, fallthrough_pc, bytes_hash, module_id); runs on the worker for
+    // jobs queued without a module. Returns false when the block cannot be lifted.
+    using Lifter = std::function<bool(uint32_t pc, CompileJob& job)>;
+    void start_worker(Lifter lifter);
+    bool worker_running() const { return worker_.joinable(); }
+    bool is_pending(uint32_t pc) const { return pending_.count(pc) != 0; }   // CPU thread only
+    void enqueue(CompileJob job);                                            // CPU thread only
+    // Blocks until the job for pc has finished (CPU thread); moves it to the front of the queue first.
+    void wait_for(uint32_t pc);
+    // Moves pc's queued job to the front (the host keeps running it: it is hot).
+    void prioritize(uint32_t pc);
+    // Hands finished blocks to the CPU thread (removes them from the pending set).
+    std::vector<CompiledBlock> take_compiled();
+    void install(uint32_t pc, BbFunc fn, uint32_t fallthrough_pc) { cache_[pc] = BBInfo{fn, fallthrough_pc}; }
+
     uint64_t cache_hits() const { return cache_hits_; }
     const std::string& cache_salt() const { return cache_salt_; }
     uint64_t cache_misses() const { return cache_misses_; }
@@ -95,11 +135,23 @@ public:
 private:
     std::unique_ptr<DiskObjectCache> objcache_;  // declared before jit_: the compiler holds a pointer to it
     std::string cache_salt_;
-    uint64_t cache_hits_ = 0, cache_misses_ = 0;
+    std::atomic<uint64_t> cache_hits_{0}, cache_misses_{0};   // worker and CPU thread
     std::unique_ptr<llvm::orc::LLJIT> jit_;
     std::unordered_map<uint32_t, BBInfo> cache_;
     int opt_level_ = 2;
     uint32_t executing_bb_pc_ = 0;  // PC of currently-executing BB (0 = none)
+
+    // addIRModule + symbol lookup (compiles on the calling thread); does not touch cache_.
+    BbFunc materialize(uint32_t pc, std::unique_ptr<llvm::Module> module, std::unique_ptr<llvm::LLVMContext> ctx);
+    void worker_loop();
+    Lifter lifter_;
+    std::thread worker_;
+    std::mutex queue_mu_;
+    std::condition_variable queue_cv_, done_cv_;
+    std::deque<CompileJob> queue_;
+    std::vector<CompiledBlock> done_;
+    std::unordered_set<uint32_t> pending_;   // CPU thread only
+    bool stop_ = false;
     // Cached pass pipeline (built once in init(), reused across optimize_module() calls).
     // pass_machine_ outlives pb_, which holds it.
     std::unique_ptr<llvm::TargetMachine> pass_machine_;

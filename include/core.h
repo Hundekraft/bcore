@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 #include "bcore_profile.h"
 #include "cpu_state.h"
@@ -27,6 +28,13 @@ public:
     bool init(int opt_level = 2, int codegen_level = -1);
     void invalidate();
     bool run(uint32_t pc);
+    // Asynchronous compilation: a block that is neither compiled nor cached is lifted here and compiled on a
+    // worker thread; run() then returns false with not_ready() set, and the host executes the code some
+    // other way (op1emu interprets one instruction) and calls run() again. run_sync() waits for the
+    // compile instead (for code the host cannot run otherwise). Off by default (deterministic hosts).
+    void set_async_compile(bool on);
+    bool run_sync(uint32_t pc);
+    bool not_ready() const { return not_ready_; }
     std::tuple<std::string, uint32_t> disassemble(uint32_t pc);
     void set_dump_ir(bool enable);
     // Persistent JIT object cache directory (see JitEngine::set_object_cache_dir); "" disables it.
@@ -78,6 +86,10 @@ public:
 
 private:
     void applyModuleTarget();
+    bool run_impl(uint32_t pc, bool may_defer);
+    void install_compiled();
+    void start_async_worker();
+    uint64_t hash_code(uint32_t pc, uint32_t end_pc) const;
     // (Re)registers the code-map listener on jit_. Called by init/invalidate.
     void attachProfiler();
 
@@ -98,4 +110,7 @@ private:
     uint64_t translate_ns_ = 0, translate_count_ = 0;
     int codegen_level_ = -1;
     bool dump_ir_ = false;
+    bool async_ = false;
+    bool not_ready_ = false;
+    std::unordered_map<uint32_t, uint32_t> pending_hits_;   // async: times the host arrived at a compiling block
 };

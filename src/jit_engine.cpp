@@ -79,7 +79,103 @@ public:
 };
 
 JitEngine::JitEngine() : objcache_(std::make_unique<DiskObjectCache>()) {}
-JitEngine::~JitEngine() = default;
+JitEngine::~JitEngine() {
+    if (worker_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mu_);
+            stop_ = true;
+        }
+        queue_cv_.notify_all();
+        worker_.join();
+    }
+}
+
+void JitEngine::start_worker(Lifter lifter) {
+    if (worker_.joinable()) return;
+    lifter_ = std::move(lifter);
+    worker_ = std::thread([this] { worker_loop(); });
+}
+
+void JitEngine::enqueue(CompileJob job) {
+    pending_.insert(job.pc);
+    {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        queue_.push_back(std::move(job));   // in request order; hot blocks are moved up by prioritize()
+    }
+    queue_cv_.notify_one();
+}
+
+void JitEngine::prioritize(uint32_t pc) {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+        if (it->pc != pc) continue;
+        if (it != queue_.begin()) {
+            CompileJob job = std::move(*it);
+            queue_.erase(it);
+            queue_.push_front(std::move(job));
+        }
+        break;
+    }
+}
+
+void JitEngine::wait_for(uint32_t pc) {
+    prioritize(pc);
+    std::unique_lock<std::mutex> lock(queue_mu_);
+    done_cv_.wait(lock, [&] {
+        for (const auto& d : done_)
+            if (d.pc == pc) return true;
+        return false;
+    });
+}
+
+std::vector<JitEngine::CompiledBlock> JitEngine::take_compiled() {
+    std::vector<CompiledBlock> out;
+    {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        out.swap(done_);
+    }
+    for (const auto& d : out) pending_.erase(d.pc);
+    return out;
+}
+
+void JitEngine::worker_loop() {
+    for (;;) {
+        CompileJob job;
+        {
+            std::unique_lock<std::mutex> lock(queue_mu_);
+            queue_cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            if (stop_) return;
+            job = std::move(queue_.front());
+            queue_.pop_front();
+        }
+        CompiledBlock done;
+        bool cached = false;
+        if (!job.module) {
+            // Queued by pc only: lift here, so the CPU thread never waits for the lifter either.
+            if (!lifter_ || !lifter_(job.pc, job)) {
+                done.pc = job.pc;
+                std::lock_guard<std::mutex> lock(queue_mu_);
+                done_.push_back(std::move(done));
+                done_cv_.notify_all();
+                continue;
+            }
+            cached = tag_cached_module(*job.module);
+            job.module_id = job.module->getModuleIdentifier();
+        }
+        if (!cached) optimize_module(*job.module);
+        done.pc = job.pc;
+        done.end_pc = job.end_pc;
+        done.fallthrough_pc = job.fallthrough_pc;
+        done.bytes_hash = job.bytes_hash;
+        done.module_id = job.module_id;
+        done.fn = materialize(job.pc, std::move(job.module), std::move(job.context));
+        {
+            std::lock_guard<std::mutex> lock(queue_mu_);
+            done_.push_back(std::move(done));
+        }
+        done_cv_.notify_all();
+    }
+}
 
 // Helper to create a JITEvaluatedSymbol from a function pointer
 static llvm::JITEvaluatedSymbol sym_from_ptr(void* ptr) {
@@ -266,15 +362,14 @@ void JitEngine::optimize_module(llvm::Module& mod) {
     mpm.run(mod, mam);
 }
 
-bool JitEngine::addModule(uint32_t pc, std::unique_ptr<llvm::Module> module,
-                          std::unique_ptr<llvm::LLVMContext> ctx,
-                          uint32_t fallthrough_pc) {
+BbFunc JitEngine::materialize(uint32_t pc, std::unique_ptr<llvm::Module> module,
+                              std::unique_ptr<llvm::LLVMContext> ctx) {
     auto tsm = llvm::orc::ThreadSafeModule(std::move(module), std::move(ctx));
 
     if (auto err = jit_->addIRModule(std::move(tsm))) {
         llvm::errs() << "Failed to add module for PC=0x" << llvm::format_hex(pc, 8)
                      << ": " << err << "\n";
-        return false;
+        return nullptr;
     }
 
     // Look up the function
@@ -284,9 +379,16 @@ bool JitEngine::addModule(uint32_t pc, std::unique_ptr<llvm::Module> module,
     auto sym = jit_->lookup(name);
     if (!sym) {
         llvm::errs() << "Failed to lookup " << name << ": " << sym.takeError() << "\n";
-        return false;
+        return nullptr;
     }
-    auto fn = reinterpret_cast<BbFunc>(sym->getValue());
+    return reinterpret_cast<BbFunc>(sym->getValue());
+}
+
+bool JitEngine::addModule(uint32_t pc, std::unique_ptr<llvm::Module> module,
+                          std::unique_ptr<llvm::LLVMContext> ctx,
+                          uint32_t fallthrough_pc) {
+    BbFunc fn = materialize(pc, std::move(module), std::move(ctx));
+    if (!fn) return false;
     cache_[pc] = BBInfo{fn, fallthrough_pc};
     return true;
 }
