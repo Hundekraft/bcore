@@ -105,8 +105,7 @@ void Core::start_async_worker() {
 
 uint64_t Core::hash_code(uint32_t pc, uint32_t end_pc) const {
     std::string bytes;
-    bytes.reserve(end_pc > pc ? end_pc - pc : 0);
-    for (uint32_t a = pc; a < end_pc; ++a) bytes.push_back((char)mem_->read8(a));
+    if (end_pc > pc) append_guest_bytes(mem_, pc, end_pc - pc, bytes);
     return llvm::xxHash64(bytes);
 }
 
@@ -310,21 +309,29 @@ void Core::set_object_cache_dir(const std::string& dir) {
 uint64_t Core::object_cache_hits() const { return cache_hits_base_ + (jit_ ? jit_->cache_hits() : 0); }
 uint64_t Core::object_cache_misses() const { return cache_misses_base_ + (jit_ ? jit_->cache_misses() : 0); }
 
-size_t Core::prefetch_pack() {
-    if (!async_ || !jit_ || !jit_->worker_running()) return 0;
+void Core::prefetch_pack() {
+    prefetch_pcs_.clear();
+    prefetch_pos_ = 0;
+    if (!async_ || !jit_ || !jit_->worker_running()) return;
     ObjectPack* pack = jit_->object_pack();
-    if (!pack || !pack->Enabled()) return 0;
-    size_t n = 0;
-    for (uint32_t pc : pack->BlockPcs()) {
+    if (!pack || !pack->Enabled()) return;
+    prefetch_pcs_ = pack->BlockPcs();
+}
+
+size_t Core::prefetch_step(size_t n) {
+    size_t queued = 0;
+    if (!async_ || !jit_ || !jit_->worker_running()) { prefetch_pos_ = prefetch_pcs_.size(); return 0; }
+    for (const size_t end = std::min(prefetch_pcs_.size(), prefetch_pos_ + n); prefetch_pos_ < end; ++prefetch_pos_) {
+        const uint32_t pc = prefetch_pcs_[prefetch_pos_];
         if (jit_->lookup(pc) || jit_->is_pending(pc)) continue;
         JitEngine::CompileJob job;
         job.pc = pc;
         if (!jit_->match_by_bytes(pc, mem_, job)) continue;
         job.bytes_hash = hash_code(pc, job.end_pc);
         jit_->enqueue_low(std::move(job));
-        ++n;
+        ++queued;
     }
-    return n;
+    return queued;
 }
 
 void Core::invalidate() {

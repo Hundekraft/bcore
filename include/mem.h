@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <string>
 
 class Memory {
 public:
@@ -43,6 +45,25 @@ public:
     struct FastRange { uint32_t lo, size; uintptr_t host; };
     virtual int fast_ranges(FastRange* out, int max) const { (void)out; (void)max; return 0; }
 };
+
+// Appends guest bytes [addr, addr + len) to out: copied straight from host memory when the whole range is
+// plain memory ([0, rawmem_limit()) or one fast range), read8 by read8 otherwise. Hashing guest code
+// (pack matching, stale-compile checks) goes through here.
+inline void append_guest_bytes(const Memory* mem, uint32_t addr, uint32_t len, std::string& out) {
+    const uint64_t end = (uint64_t)addr + len;
+    const uint8_t* src = nullptr;
+    if (!mem->is_fastmem() && end <= mem->rawmem_limit()) {
+        src = (const uint8_t*)(mem->fast_base() + addr);
+    } else {
+        Memory::FastRange r[8];
+        const int n = mem->fast_ranges(r, 8);
+        for (int i = 0; i < n && !src; ++i)
+            if (addr >= r[i].lo && end <= (uint64_t)r[i].lo + r[i].size) src = (const uint8_t*)(r[i].host + (addr - r[i].lo));
+    }
+    if (src) { out.append((const char*)src, len); return; }
+    out.reserve(out.size() + len);
+    for (uint32_t i = 0; i < len; ++i) out.push_back((char)mem->read8(addr + i));
+}
 
 // extern "C" wrappers for JIT-generated code
 extern "C" {

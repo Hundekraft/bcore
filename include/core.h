@@ -29,8 +29,13 @@ public:
     bool init(int opt_level = 2, int codegen_level = -1);
     void invalidate();
     // Async compile only: queues, at low priority, a pack load for every block in the cache's byte index whose
-    // guest bytes are in memory now, so code runs compiled the first time it is reached. Returns the count.
-    size_t prefetch_pack();
+    // guest bytes are in memory now, so code runs compiled the first time it is reached. prefetch_pack() starts
+    // the scan; prefetch_step(n) checks the next n index entries and returns how many it queued, so a host can
+    // spread the scan over its loop instead of stalling (tens of thousands of entries with two firmwares in
+    // one cache); prefetch_active() is true until the scan is through.
+    void prefetch_pack();
+    size_t prefetch_step(size_t n);
+    bool prefetch_active() const { return prefetch_pos_ < prefetch_pcs_.size(); }
     bool run(uint32_t pc);
     // Asynchronous compilation: a block that is neither compiled nor cached is lifted here and compiled on a
     // worker thread; run() then returns false with not_ready() set, and the host executes the code some
@@ -117,5 +122,7 @@ private:
     bool async_ = false;
     bool not_ready_ = false;
     std::unordered_map<uint32_t, uint32_t> pending_hits_;
+    std::vector<uint32_t> prefetch_pcs_;
+    size_t prefetch_pos_ = 0;
     std::mutex lift_mu_;   // async: times the host arrived at a compiling block
 };

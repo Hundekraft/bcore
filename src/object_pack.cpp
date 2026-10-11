@@ -140,7 +140,6 @@ void ObjectPack::AddBlock(uint32_t pc, const BlockBytes& b) {
 uint64_t ObjectPack::HashBytes(Memory* mem, uint32_t pc, uint32_t len) const {
     std::string buf = salt_;
     buf.append((const char*)&pc, 4);
-    buf.reserve(buf.size() + len);
-    for (uint32_t i = 0; i < len; ++i) buf.push_back((char)mem->read8(pc + i));
+    append_guest_bytes(mem, pc, len, buf);
     return llvm::xxHash64(buf);
 }
