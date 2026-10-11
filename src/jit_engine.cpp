@@ -130,11 +130,16 @@ void JitEngine::wait_for(uint32_t pc) {
 
 std::vector<JitEngine::CompiledBlock> JitEngine::take_compiled() {
     std::vector<CompiledBlock> out;
+    if (!has_done_.load(std::memory_order_acquire)) return out;
     {
         std::lock_guard<std::mutex> lock(queue_mu_);
         out.swap(done_);
+        has_done_.store(false, std::memory_order_relaxed);
     }
-    for (const auto& d : out) pending_.erase(d.pc);
+    for (const auto& d : out) {
+        pending_.erase(d.pc);
+        if (d.from_pack && !d.fn) pack_failed_.insert(d.pc);
+    }
     return out;
 }
 
@@ -149,6 +154,21 @@ void JitEngine::worker_loop() {
             queue_.pop_front();
         }
         CompiledBlock done;
+        if (!job.obj_key.empty()) {   // byte-index hit: link the stored object, no lift or compile
+            done.pc = job.pc;
+            done.end_pc = job.end_pc;
+            done.fallthrough_pc = job.fallthrough_pc;
+            done.bytes_hash = job.bytes_hash;
+            done.from_pack = true;
+            done.fn = load_object(job.pc, job.obj_key);
+            {
+                std::lock_guard<std::mutex> lock(queue_mu_);
+                done_.push_back(std::move(done));
+                has_done_.store(true, std::memory_order_release);
+            }
+            done_cv_.notify_all();
+            continue;
+        }
         bool cached = false;
         if (!job.module) {
             // Queued by pc only: lift here, so the CPU thread never waits for the lifter either.
@@ -156,6 +176,7 @@ void JitEngine::worker_loop() {
                 done.pc = job.pc;
                 std::lock_guard<std::mutex> lock(queue_mu_);
                 done_.push_back(std::move(done));
+                has_done_.store(true, std::memory_order_release);
                 done_cv_.notify_all();
                 continue;
             }
@@ -172,6 +193,7 @@ void JitEngine::worker_loop() {
         {
             std::lock_guard<std::mutex> lock(queue_mu_);
             done_.push_back(std::move(done));
+            has_done_.store(true, std::memory_order_release);
         }
         done_cv_.notify_all();
     }
@@ -465,6 +487,40 @@ bool JitEngine::tag_cached_module(llvm::Module& mod) {
 
 void JitEngine::set_object_pack(ObjectPack* pack) { objcache_->pack = pack; }
 
+BbFunc JitEngine::load_object(uint32_t pc, const std::string& key) {
+    ObjectPack* pack = objcache_->pack;
+    const std::string* obj = pack ? pack->FindObject(key) : nullptr;
+    if (!obj) return nullptr;
+    if (auto err = jit_->addObjectFile(llvm::MemoryBuffer::getMemBufferCopy(*obj))) {
+        llvm::consumeError(std::move(err));
+        return nullptr;
+    }
+    char name[32];
+    snprintf(name, sizeof(name), "bb_0x%08x", pc);
+    auto sym = jit_->lookup(name);
+    if (!sym) {
+        llvm::consumeError(sym.takeError());
+        return nullptr;
+    }
+    ++cache_hits_;
+    return reinterpret_cast<BbFunc>(sym->getValue());
+}
+
+bool JitEngine::match_by_bytes(uint32_t pc, Memory* mem, CompileJob& job) {
+    ObjectPack* pack = objcache_->pack;
+    if (!pack || !pack->Enabled() || pack_failed_.count(pc)) return false;
+    const auto* cands = pack->FindBlocks(pc);
+    if (!cands) return false;
+    for (const auto& b : *cands) {
+        if (pack->HashBytes(mem, pc, b.len) != b.hash || !pack->FindObject(b.objKey)) continue;
+        job.obj_key = b.objKey;
+        job.end_pc = pc + b.len;
+        job.fallthrough_pc = b.fallthrough;
+        return true;
+    }
+    return false;
+}
+
 bool JitEngine::try_load_by_bytes(uint32_t pc, Memory* mem) {
     ObjectPack* pack = objcache_->pack;
     if (!pack || !pack->Enabled()) return false;
@@ -472,21 +528,10 @@ bool JitEngine::try_load_by_bytes(uint32_t pc, Memory* mem) {
     if (!cands) return false;
     for (const auto& b : *cands) {
         if (pack->HashBytes(mem, pc, b.len) != b.hash) continue;
-        const std::string* obj = pack->FindObject(b.objKey);
-        if (!obj) continue;
-        if (auto err = jit_->addObjectFile(llvm::MemoryBuffer::getMemBufferCopy(*obj))) {
-            llvm::consumeError(std::move(err));
-            return false;
-        }
-        char name[32];
-        snprintf(name, sizeof(name), "bb_0x%08x", pc);
-        auto sym = jit_->lookup(name);
-        if (!sym) {
-            llvm::consumeError(sym.takeError());
-            return false;
-        }
-        cache_[pc] = BBInfo{reinterpret_cast<BbFunc>(sym->getValue()), b.fallthrough};
-        ++cache_hits_;
+        if (!pack->FindObject(b.objKey)) continue;
+        BbFunc fn = load_object(pc, b.objKey);
+        if (!fn) return false;
+        cache_[pc] = BBInfo{fn, b.fallthrough};
         return true;
     }
     return false;

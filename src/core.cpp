@@ -134,29 +134,32 @@ bool Core::run_impl(uint32_t pc, bool may_defer) {
         not_ready_ = true;
         return false;
     }
-    if (!fn && jit_->try_load_by_bytes(pc, mem_))
+    if (!fn && !async_ && jit_->try_load_by_bytes(pc, mem_))
         fn = jit_->lookup(pc);
-    if (!fn && async_) {
+    // Async: pack loads go to the workers too (linking an object costs ~0.1-1 ms, many of them in a row
+    // stalled the CPU thread when a new screen came up). A failed pack load is retried as a compile.
+    for (int attempt = 0; !fn && async_ && attempt < 2; ++attempt) {
         if (!jit_->is_pending(pc)) {
             JitEngine::CompileJob job;   // no module: the worker lifts it (see start_async_worker)
             job.pc = pc;
+            if (jit_->match_by_bytes(pc, mem_, job))
+                job.bytes_hash = hash_code(pc, job.end_pc);
+            else
+                ++translate_count_;
             jit_->enqueue(std::move(job));
-            ++translate_count_;
         }
-        if (!fn) {
-            if (may_defer) {
-                // A block the host keeps arriving at is hot: compile it next.
-                const uint32_t hits = ++pending_hits_[pc];
-                if ((hits & (hits - 1)) == 0 && hits >= 2) jit_->prioritize(pc);
-                not_ready_ = true;
-                return false;
-            }
-            jit_->wait_for(pc);
-            install_compiled();
-            fn = jit_->lookup(pc);
-            if (!fn) return false;
+        if (may_defer) {
+            // A block the host keeps arriving at is hot: compile it next.
+            const uint32_t hits = ++pending_hits_[pc];
+            if ((hits & (hits - 1)) == 0 && hits >= 2) jit_->prioritize(pc);
+            not_ready_ = true;
+            return false;
         }
+        jit_->wait_for(pc);
+        install_compiled();
+        fn = jit_->lookup(pc);
     }
+    if (!fn && async_) return false;
     if (!fn) {
         const auto host_t0 = std::chrono::steady_clock::now();
         struct AddTime {

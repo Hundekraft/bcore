@@ -84,6 +84,7 @@ public:
         uint32_t pc = 0, end_pc = 0, fallthrough_pc = 0;
         uint64_t bytes_hash = 0;    // guest code bytes [pc, end_pc) when lifted
         std::string module_id;
+        std::string obj_key;        // non-empty: load this object from the pack (byte-index hit) instead of compiling
         // context before module: members are destroyed in reverse order, and a Module must go before its context.
         std::unique_ptr<llvm::LLVMContext> context;
         std::unique_ptr<llvm::Module> module;
@@ -93,7 +94,11 @@ public:
         uint64_t bytes_hash = 0;
         std::string module_id;
         BbFunc fn = nullptr;        // nullptr: compile failed
+        bool from_pack = false;     // a pack load (obj_key job)
     };
+    // CPU thread: when guest memory at pc holds the bytes of a block in the pack's byte index, fills job's
+    // obj_key, end_pc and fallthrough_pc (the worker then only loads the object). Skips pcs whose load failed.
+    bool match_by_bytes(uint32_t pc, Memory* mem, CompileJob& job);
     // Lifts pc into job (module, context, end_pc, fallthrough_pc, bytes_hash, module_id); runs on the worker for
     // jobs queued without a module. Returns false when the block cannot be lifted.
     using Lifter = std::function<bool(uint32_t pc, CompileJob& job)>;
@@ -157,7 +162,11 @@ private:
     std::condition_variable queue_cv_, done_cv_;
     std::deque<CompileJob> queue_;
     std::vector<CompiledBlock> done_;
+    std::atomic<bool> has_done_{false};   // done_ non-empty: lets take_compiled() skip the lock on every block run
     std::unordered_set<uint32_t> pending_;   // CPU thread only
+    std::unordered_set<uint32_t> pack_failed_;   // CPU thread only: pack loads that failed (compile those)
+    // addObjectFile + symbol lookup of a pack object (any thread); does not touch cache_.
+    BbFunc load_object(uint32_t pc, const std::string& key);
     bool stop_ = false;
     // Cached pass pipeline (built once in init(), reused across optimize_module() calls).
     // pass_machine_ outlives pb_, which holds it.
