@@ -891,12 +891,9 @@ llvm::Value* LiftVisitor::emit_mem_read(const char* fn, llvm::Type* ret_ty, llvm
         auto* fast_bb = builder_.GetInsertBlock();
         builder_.CreateBr(bb_done);
 
-        // Slow path: extern call (for MMR addresses, fault addresses, etc.)
+        // Slow path: other plain memory directly, else extern call (for MMR addresses, fault addresses, etc.)
         builder_.SetInsertPoint(bb_slow);
-        auto* ft = llvm::FunctionType::get(ret_ty,
-            {builder_.getInt8PtrTy(), builder_.getInt32Ty()}, false);
-        auto* slow_result = call_extern(fn, ft, {mem_ptr_, addr});
-        emit_did_jump_exit(true);  // fault may have set did_jump
+        auto* slow_result = emit_ranged_read(fn, ret_ty, addr);
         auto* slow_bb = builder_.GetInsertBlock();
         builder_.CreateBr(bb_done);
 
@@ -906,12 +903,72 @@ llvm::Value* LiftVisitor::emit_mem_read(const char* fn, llvm::Type* ret_ty, llvm
         phi->addIncoming(slow_result, slow_bb);
         return phi;
     }
+    return emit_ranged_read(fn, ret_ty, addr);
+}
+
+llvm::Value* LiftVisitor::emit_ranged_read(const char* fn, llvm::Type* ret_ty, llvm::Value* addr) {
+    Memory::FastRange ranges[8];
+    const int n = (mem_ && !fastmem_) ? mem_->fast_ranges(ranges, 8) : 0;
+    auto& ctx = builder_.getContext();
+    auto* fn_ = builder_.GetInsertBlock()->getParent();
+    auto* bb_done = n ? llvm::BasicBlock::Create(ctx, "range_rd_done", fn_) : nullptr;
+    std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incoming;
+    for (int i = 0; i < n; ++i) {
+        auto* bb_hit = llvm::BasicBlock::Create(ctx, "range_rd_hit", fn_);
+        auto* bb_next = llvm::BasicBlock::Create(ctx, "range_rd_next", fn_);
+        auto* off = builder_.CreateSub(addr, builder_.getInt32(ranges[i].lo), "range_off");
+        builder_.CreateCondBr(builder_.CreateICmpULT(off, builder_.getInt32(ranges[i].size)), bb_hit, bb_next);
+        builder_.SetInsertPoint(bb_hit);
+        auto* host = builder_.CreateAdd(ConstantInt::get(builder_.getInt64Ty(), ranges[i].host),
+                                        builder_.CreateZExt(off, builder_.getInt64Ty()));
+        auto* v = builder_.CreateAlignedLoad(ret_ty, builder_.CreateIntToPtr(host, ret_ty->getPointerTo()),
+                                             llvm::MaybeAlign(1));
+        incoming.push_back({v, builder_.GetInsertBlock()});
+        builder_.CreateBr(bb_done);
+        builder_.SetInsertPoint(bb_next);
+    }
     auto* ft = llvm::FunctionType::get(ret_ty,
         {builder_.getInt8PtrTy(), builder_.getInt32Ty()}, false);
     auto* result = call_extern(fn, ft, {mem_ptr_, addr});
     // If mem_read failed, must break out immediately to avoid follow-up instructions
     emit_did_jump_exit(true);
-    return result;
+    if (!n) return result;
+    incoming.push_back({result, builder_.GetInsertBlock()});
+    builder_.CreateBr(bb_done);
+    builder_.SetInsertPoint(bb_done);
+    auto* phi = builder_.CreatePHI(ret_ty, (unsigned)incoming.size(), "range_val");
+    for (auto& [v, bb] : incoming) phi->addIncoming(v, bb);
+    return phi;
+}
+
+void LiftVisitor::emit_ranged_write(const char* fn, llvm::Value* addr, llvm::Value* val) {
+    Memory::FastRange ranges[8];
+    const int n = (mem_ && !fastmem_) ? mem_->fast_ranges(ranges, 8) : 0;
+    auto& ctx = builder_.getContext();
+    auto* fn_ = builder_.GetInsertBlock()->getParent();
+    auto* bb_done = n ? llvm::BasicBlock::Create(ctx, "range_wr_done", fn_) : nullptr;
+    for (int i = 0; i < n; ++i) {
+        auto* bb_hit = llvm::BasicBlock::Create(ctx, "range_wr_hit", fn_);
+        auto* bb_next = llvm::BasicBlock::Create(ctx, "range_wr_next", fn_);
+        auto* off = builder_.CreateSub(addr, builder_.getInt32(ranges[i].lo), "range_off");
+        builder_.CreateCondBr(builder_.CreateICmpULT(off, builder_.getInt32(ranges[i].size)), bb_hit, bb_next);
+        builder_.SetInsertPoint(bb_hit);
+        auto* host = builder_.CreateAdd(ConstantInt::get(builder_.getInt64Ty(), ranges[i].host),
+                                        builder_.CreateZExt(off, builder_.getInt64Ty()));
+        builder_.CreateAlignedStore(val, builder_.CreateIntToPtr(host, val->getType()->getPointerTo()),
+                                    llvm::MaybeAlign(1));
+        builder_.CreateBr(bb_done);
+        builder_.SetInsertPoint(bb_next);
+    }
+    auto* val_ty = val->getType();
+    auto* ft = llvm::FunctionType::get(builder_.getVoidTy(),
+        {builder_.getInt8PtrTy(), builder_.getInt32Ty(), val_ty}, false);
+    call_extern(fn, ft, {mem_ptr_, addr, val});
+    // If mem_write failed (or an MMR write raised an exception), break out before the next instruction
+    emit_did_jump_exit(true);
+    if (!n) return;
+    builder_.CreateBr(bb_done);
+    builder_.SetInsertPoint(bb_done);
 }
 
 void LiftVisitor::emit_mem_write(const char* fn, llvm::Value* addr, llvm::Value* val) {
@@ -951,25 +1008,17 @@ void LiftVisitor::emit_mem_write(const char* fn, llvm::Value* addr, llvm::Value*
         builder_.CreateAlignedStore(val, ptr, llvm::MaybeAlign(1));
         builder_.CreateBr(bb_done);
 
-        // Slow path: extern call for MMR addresses; may raise exception or set did_jump
+        // Slow path: other plain memory directly, else extern call for MMR addresses (may raise an exception
+        // or set did_jump)
         builder_.SetInsertPoint(bb_slow);
-        auto* val_ty = val->getType();
-        auto* ft = llvm::FunctionType::get(builder_.getVoidTy(),
-            {builder_.getInt8PtrTy(), builder_.getInt32Ty(), val_ty}, false);
-        call_extern(fn, ft, {mem_ptr_, addr, val});
-        emit_did_jump_exit(true);  // MMR write may have raised an exception
+        emit_ranged_write(fn, addr, val);
         builder_.CreateBr(bb_done);
 
         builder_.SetInsertPoint(bb_done);
         return;
     }
-    // Tier 3: always extern call (rawmem_limit not available)
-    auto* val_ty = val->getType();
-    auto* ft = llvm::FunctionType::get(builder_.getVoidTy(),
-        {builder_.getInt8PtrTy(), builder_.getInt32Ty(), val_ty}, false);
-    call_extern(fn, ft, {mem_ptr_, addr, val});
-    // If mem_write failed, must break out immediately to avoid follow-up instructions
-    emit_did_jump_exit(true);
+    // Tier 3: extern call (rawmem_limit not available), after any fast ranges
+    emit_ranged_write(fn, addr, val);
 }
 
 // =============================================

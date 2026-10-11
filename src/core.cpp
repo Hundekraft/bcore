@@ -292,6 +292,11 @@ void Core::set_object_cache_dir(const std::string& dir) {
         translation_salt_ = std::string("bytes-v1|") + BCORE_SOURCE_FINGERPRINT + "|" + jit_->cache_salt() + "|fb=" +
                             std::to_string(mem_->fast_base()) + "|rl=" + std::to_string(mem_->rawmem_limit()) +
                             "|fm=" + std::to_string(mem_->is_fastmem()) + "|steps=" + std::to_string(cpu_->steps_remaining);
+        Memory::FastRange ranges[8];
+        const int nr = mem_->fast_ranges(ranges, 8);
+        for (int i = 0; i < nr; ++i)
+            translation_salt_ += "|fr=" + std::to_string(ranges[i].lo) + ":" + std::to_string(ranges[i].size) + "@" +
+                                 std::to_string(ranges[i].host);
         pack_ = std::make_shared<ObjectPack>();
         pack_->SetSalt(translation_salt_);
         pack_->Open(dir);

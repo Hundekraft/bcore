@@ -37,6 +37,11 @@ public:
     // (see Core::set_chain_budget). A host returns false once something it must react to between blocks
     // happened during the block, e.g. an MMR access.
     virtual bool allow_chain() const { return true; }
+
+    // More plain memory the JIT may access directly besides [0, rawmem_limit()): guest [lo, lo + size) at
+    // host + (addr - lo). The host pointers must stay the same across runs (they are baked into cached code).
+    struct FastRange { uint32_t lo, size; uintptr_t host; };
+    virtual int fast_ranges(FastRange* out, int max) const { (void)out; (void)max; return 0; }
 };
 
 // extern "C" wrappers for JIT-generated code

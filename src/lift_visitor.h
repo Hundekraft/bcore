@@ -624,6 +624,9 @@ private:
 
     // Memory access helpers — build FunctionType + call_extern in one call
     llvm::Value* emit_mem_read(const char* fn, llvm::Type* ret_ty, llvm::Value* addr);
+    // Extern read/write, preceded by direct accesses for Memory::fast_ranges (L1 data, scratchpad, ...).
+    llvm::Value* emit_ranged_read(const char* fn, llvm::Type* ret_ty, llvm::Value* addr);
+    void emit_ranged_write(const char* fn, llvm::Value* addr, llvm::Value* val);
     void emit_mem_write(const char* fn, llvm::Value* addr, llvm::Value* val);
 
     // Inline IR equivalents of astat_compose / astat_decompose (no extern call)
