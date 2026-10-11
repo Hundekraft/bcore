@@ -310,6 +310,23 @@ void Core::set_object_cache_dir(const std::string& dir) {
 uint64_t Core::object_cache_hits() const { return cache_hits_base_ + (jit_ ? jit_->cache_hits() : 0); }
 uint64_t Core::object_cache_misses() const { return cache_misses_base_ + (jit_ ? jit_->cache_misses() : 0); }
 
+size_t Core::prefetch_pack() {
+    if (!async_ || !jit_ || !jit_->worker_running()) return 0;
+    ObjectPack* pack = jit_->object_pack();
+    if (!pack || !pack->Enabled()) return 0;
+    size_t n = 0;
+    for (uint32_t pc : pack->BlockPcs()) {
+        if (jit_->lookup(pc) || jit_->is_pending(pc)) continue;
+        JitEngine::CompileJob job;
+        job.pc = pc;
+        if (!jit_->match_by_bytes(pc, mem_, job)) continue;
+        job.bytes_hash = hash_code(pc, job.end_pc);
+        jit_->enqueue_low(std::move(job));
+        ++n;
+    }
+    return n;
+}
+
 void Core::invalidate() {
     if (jit_) { cache_hits_base_ += jit_->cache_hits(); cache_misses_base_ += jit_->cache_misses(); }
     jit_ = std::make_shared<JitEngine>();

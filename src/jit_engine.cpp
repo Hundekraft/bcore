@@ -105,8 +105,26 @@ void JitEngine::enqueue(CompileJob job) {
     queue_cv_.notify_one();
 }
 
+void JitEngine::enqueue_low(CompileJob job) {
+    pending_.insert(job.pc);
+    {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        low_queue_.push_back(std::move(job));
+    }
+    queue_cv_.notify_one();
+}
+
+ObjectPack* JitEngine::object_pack() const { return objcache_->pack; }
+
 void JitEngine::prioritize(uint32_t pc) {
     std::lock_guard<std::mutex> lock(queue_mu_);
+    for (auto it = low_queue_.begin(); it != low_queue_.end(); ++it) {
+        if (it->pc != pc) continue;
+        CompileJob job = std::move(*it);
+        low_queue_.erase(it);
+        queue_.push_front(std::move(job));
+        return;
+    }
     for (auto it = queue_.begin(); it != queue_.end(); ++it) {
         if (it->pc != pc) continue;
         if (it != queue_.begin()) {
@@ -148,10 +166,11 @@ void JitEngine::worker_loop() {
         CompileJob job;
         {
             std::unique_lock<std::mutex> lock(queue_mu_);
-            queue_cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            queue_cv_.wait(lock, [&] { return stop_ || !queue_.empty() || !low_queue_.empty(); });
             if (stop_) return;
-            job = std::move(queue_.front());
-            queue_.pop_front();
+            auto& q = queue_.empty() ? low_queue_ : queue_;
+            job = std::move(q.front());
+            q.pop_front();
         }
         CompiledBlock done;
         if (!job.obj_key.empty()) {   // byte-index hit: link the stored object, no lift or compile

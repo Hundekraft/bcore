@@ -106,6 +106,9 @@ public:
     bool worker_running() const { return !workers_.empty(); }
     bool is_pending(uint32_t pc) const { return pending_.count(pc) != 0; }   // CPU thread only
     void enqueue(CompileJob job);                                            // CPU thread only
+    // Low priority (preloading): workers take these only when the normal queue is empty.
+    void enqueue_low(CompileJob job);                                        // CPU thread only
+    ObjectPack* object_pack() const;
     // Blocks until the job for pc has finished (CPU thread); moves it to the front of the queue first.
     void wait_for(uint32_t pc);
     // Moves pc's queued job to the front (the host keeps running it: it is hot).
@@ -160,7 +163,7 @@ private:
     std::unordered_map<std::thread::id, WorkerPasses> worker_passes_;
     std::mutex queue_mu_;
     std::condition_variable queue_cv_, done_cv_;
-    std::deque<CompileJob> queue_;
+    std::deque<CompileJob> queue_, low_queue_;
     std::vector<CompiledBlock> done_;
     std::atomic<bool> has_done_{false};   // done_ non-empty: lets take_compiled() skip the lock on every block run
     std::unordered_set<uint32_t> pending_;   // CPU thread only

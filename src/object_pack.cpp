@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "object_pack.h"
 
 #include <cstring>
@@ -109,6 +110,15 @@ const std::vector<ObjectPack::BlockBytes>* ObjectPack::FindBlocks(uint32_t pc) c
     std::lock_guard<std::mutex> lock(mu_);
     auto it = blocks_.find(pc);
     return it == blocks_.end() ? nullptr : &it->second;
+}
+
+std::vector<uint32_t> ObjectPack::BlockPcs() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<uint32_t> pcs;
+    pcs.reserve(blocks_.size());
+    for (const auto& kv : blocks_) pcs.push_back(kv.first);
+    std::sort(pcs.begin(), pcs.end());
+    return pcs;
 }
 
 void ObjectPack::AddBlock(uint32_t pc, const BlockBytes& b) {

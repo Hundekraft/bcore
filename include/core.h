@@ -28,6 +28,9 @@ public:
     // 3=Aggressive); it follows opt_level when negative.
     bool init(int opt_level = 2, int codegen_level = -1);
     void invalidate();
+    // Async compile only: queues, at low priority, a pack load for every block in the cache's byte index whose
+    // guest bytes are in memory now, so code runs compiled the first time it is reached. Returns the count.
+    size_t prefetch_pack();
     bool run(uint32_t pc);
     // Asynchronous compilation: a block that is neither compiled nor cached is lifted here and compiled on a
     // worker thread; run() then returns false with not_ready() set, and the host executes the code some

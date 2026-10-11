@@ -34,6 +34,8 @@ public:
 
     // Candidates for pc whose bytes still match guest memory (checked by the caller with HashBytes).
     const std::vector<BlockBytes>* FindBlocks(uint32_t pc) const;
+    // Every pc with an entry in the byte index (for preloading).
+    std::vector<uint32_t> BlockPcs() const;
     void AddBlock(uint32_t pc, const BlockBytes& b);
 
     // Hash of the guest code bytes [pc, pc + len) plus pc and the translation settings salt.
