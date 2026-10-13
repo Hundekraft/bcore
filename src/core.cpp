@@ -290,7 +290,7 @@ void Core::set_object_cache_dir(const std::string& dir) {
         // and the memory model the lifter bakes in.
         translation_salt_ = std::string("bytes-v1|") + BCORE_SOURCE_FINGERPRINT + "|" + jit_->cache_salt() + "|fb=" +
                             std::to_string(mem_->fast_base()) + "|rl=" + std::to_string(mem_->rawmem_limit()) +
-                            "|fm=" + std::to_string(mem_->is_fastmem()) + "|steps=" + std::to_string(cpu_->steps_remaining);
+                            "|dc=" + std::to_string(mem_->strict_data_checks()) + "|fm=" + std::to_string(mem_->is_fastmem()) + "|steps=" + std::to_string(cpu_->steps_remaining);
         Memory::FastRange ranges[8];
         const int nr = mem_->fast_ranges(ranges, 8);
         for (int i = 0; i < nr; ++i)

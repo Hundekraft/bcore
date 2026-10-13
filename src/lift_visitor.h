@@ -623,6 +623,7 @@ private:
     CmpFlags emit_cc_cmp(llvm::Value* src, llvm::Value* dst);
 
     // Memory access helpers — build FunctionType + call_extern in one call
+    void emit_data_alignment(llvm::Value* addr, unsigned width, bool write);
     llvm::Value* emit_mem_read(const char* fn, llvm::Type* ret_ty, llvm::Value* addr);
     // Extern read/write, preceded by direct accesses for Memory::fast_ranges (L1 data, scratchpad, ...).
     llvm::Value* emit_ranged_read(const char* fn, llvm::Type* ret_ty, llvm::Value* addr);

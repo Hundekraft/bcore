@@ -369,6 +369,8 @@ bool JitEngine::init(int opt_level, int codegen_level) {
     symbols[jit_->mangleAndIntern("mem_write32")]         = sym_from_ptr(reinterpret_cast<void*>(&mem_write32));
     symbols[jit_->mangleAndIntern("bfin_syscall")]        = sym_from_ptr(reinterpret_cast<void*>(&bfin_syscall));
     symbols[jit_->mangleAndIntern("bfin_putchar")]        = sym_from_ptr(reinterpret_cast<void*>(&bfin_putchar));
+    symbols[jit_->mangleAndIntern("cec_check_data")] = sym_from_ptr(reinterpret_cast<void*>(&cec_check_data));
+    symbols[jit_->mangleAndIntern("cec_data_alignment")] = sym_from_ptr(reinterpret_cast<void*>(&cec_data_alignment));
     symbols[jit_->mangleAndIntern("cec_exception")]       = sym_from_ptr(reinterpret_cast<void*>(&cec_exception));
     symbols[jit_->mangleAndIntern("cec_raise")]           = sym_from_ptr(reinterpret_cast<void*>(&cec_raise));
     symbols[jit_->mangleAndIntern("cec_return_rti")]      = sym_from_ptr(reinterpret_cast<void*>(&cec_return_rti));

@@ -528,3 +528,24 @@ extern "C" __attribute__((hot)) bool user_mmr_check(CpuState* cpu, uint32_t addr
     }
     return false;
 }
+
+// BF5xx DCPLB fault status: write bit 16, supervisor bit 17, DAG1 bit 18.
+extern "C" void cec_data_alignment(CpuState* cpu, Memory* mem, uint32_t pc,
+                                    uint32_t addr, uint32_t flags) {
+    const uint32_t status = flags | (cec_is_user_mode() ? 0u : (1u << 17));
+    cpu->pc = pc;
+    mem->data_alignment_fault(pc, addr, status);
+    cec_exception(cpu, 0x24u, mem);
+}
+
+extern "C" void cec_check_data(CpuState* cpu, Memory* mem, uint32_t pc,
+                               uint32_t addr, uint32_t width, uint32_t flags) {
+    const uint32_t status = flags | (cec_is_user_mode() ? 0u : (1u << 17));
+    const uint32_t fault = mem->check_data_access(pc, addr, width, status);
+    if (!fault) return;
+    cpu->pc = pc;
+    if (fault == UINT32_MAX) {
+        // Diagnostic stop, not an invented hardware exception.
+        cpu->halted = true; cpu->exit_code = 1; cpu->did_jump = true;
+    } else cec_exception(cpu, fault, mem);
+}

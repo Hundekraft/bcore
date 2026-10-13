@@ -19,6 +19,17 @@ public:
     virtual void write16(uint32_t addr, uint16_t val) = 0;
     virtual void write32(uint32_t addr, uint32_t val) = 0;
 
+    // Host records fault MMRs before the core enters EVT3. No CPLB model is implied.
+    virtual void data_alignment_fault(uint32_t pc, uint32_t addr, uint32_t status) {
+        (void)pc; (void)addr; (void)status;
+    }
+
+    // Optional diagnostic protection model; return exception code, or UINT32_MAX
+    // for an unmapped bus access that the host cannot faithfully model yet.
+    virtual bool strict_data_checks() const { return false; }
+    virtual uint32_t check_data_access(uint32_t pc, uint32_t addr, uint32_t width, uint32_t flags, bool record = true) {
+        (void)pc; (void)addr; (void)width; (void)flags; (void)record; return 0;
+    }
     virtual const uint8_t* raw() const = 0;
 
     // Host address corresponding to emulator address 0x0.
